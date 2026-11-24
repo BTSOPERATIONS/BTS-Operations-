@@ -24,11 +24,13 @@ const local = {
   },
 };
 
+// New "sb_publishable_..." keys go in the apikey header only.
+// Old "eyJ..." (legacy anon) keys are JWTs and are also sent as a Bearer token.
 const headers = {
   apikey: anon,
-  Authorization: "Bearer " + anon,
   "Content-Type": "application/json",
 };
+if (anon && anon.startsWith("eyJ")) headers.Authorization = "Bearer " + anon;
 
 const remote = {
   async get(key) {
