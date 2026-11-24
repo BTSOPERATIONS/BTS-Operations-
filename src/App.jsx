@@ -13,6 +13,7 @@ import {
   ChevronDown,
   Search,
   Package,
+  Download,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -53,6 +54,36 @@ const STORAGE_KEY = "bts-work-orders-v1";
 const REPORTS_KEY = "bts-daily-report-history-v1";
 const HOURS_KEY = "bts-time-entries-v1";
 const WORKERS_KEY = "bts-worker-list-v1";
+
+function csvCell(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number") return String(v);
+  let t = String(v);
+  // stop spreadsheet apps from running text that starts like a formula
+  if (/^[=+\-@]/.test(t)) t = "'" + t;
+  return /[",\n\r]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+}
+
+function downloadCSV(filename, headers, rows) {
+  const lines = [headers, ...rows].map((r) => r.map(csvCell).join(","));
+  const blob = new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function ExportBtn({ onClick, label = "Export CSV" }) {
+  return (
+    <button className="wo-btn ghost" onClick={onClick} title="Download as a CSV file (opens in Excel)">
+      <Download size={13} /> {label}
+    </button>
+  );
+}
 
 function fmtHours(n) {
   return (Math.round(n * 100) / 100).toString();
@@ -205,6 +236,7 @@ export default function WorkOrderDashboard() {
   const [reportHistory, setReportHistory] = useState([]);
   const [timeEntries, setTimeEntries] = useState([]);
   const [workerList, setWorkerList] = useState([]);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
 
   // ---- load ----
   useEffect(() => {
@@ -368,6 +400,21 @@ export default function WorkOrderDashboard() {
   function removeOrder(id) {
     if (!orders) return;
     persist(orders.filter((o) => o.id !== id));
+    // also remove hours that were logged against this work order
+    persistHours(timeEntries.filter((t) => t.woId !== id));
+    setConfirmDeleteId(null);
+  }
+
+  function purgeOrphanHours() {
+    if (!orders) return;
+    const ids = new Set(orders.map((o) => o.id));
+    persistHours(timeEntries.filter((t) => ids.has(t.woId)));
+  }
+
+  function deleteReportDay(date) {
+    const next = reportHistory.filter((r) => r.date !== date);
+    setReportHistory(next);
+    window.storage.set(REPORTS_KEY, JSON.stringify(next), true).catch(() => {});
   }
 
   const assignees = useMemo(() => {
@@ -902,6 +949,20 @@ export default function WorkOrderDashboard() {
                         </option>
                       ))}
                     </select>
+                    <ExportBtn
+                      onClick={() =>
+                        downloadCSV(
+                          `work-orders-${todayISO()}.csv`,
+                          ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Status", "Opened", "Due", "Closed", "Hours logged", "Notes"],
+                          filtered.map((o) => [
+                            o.id, o.title, o.productCode, o.productName, o.assignee, o.priority, o.status,
+                            o.createdDate, o.dueDate, o.closedDate || "",
+                            hoursByWO[o.id] ? Math.round(hoursByWO[o.id] * 100) / 100 : "",
+                            o.notes,
+                          ])
+                        )
+                      }
+                    />
                     <button
                       className="wo-btn"
                       onClick={() => {
@@ -1012,13 +1073,32 @@ export default function WorkOrderDashboard() {
                                   >
                                     <FileText size={14} />
                                   </button>
-                                  <button
-                                    className="wo-icon-btn"
-                                    title="Delete"
-                                    onClick={() => removeOrder(o.id)}
-                                  >
-                                    <X size={14} />
-                                  </button>
+                                  {confirmDeleteId === o.id ? (
+                                    <>
+                                      <button
+                                        className="wo-btn"
+                                        style={{ background: BRAND.danger, padding: "3px 8px" }}
+                                        onClick={() => removeOrder(o.id)}
+                                      >
+                                        Delete + its hours?
+                                      </button>
+                                      <button
+                                        className="wo-icon-btn"
+                                        title="Cancel"
+                                        onClick={() => setConfirmDeleteId(null)}
+                                      >
+                                        <X size={14} />
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      className="wo-icon-btn"
+                                      title="Delete"
+                                      onClick={() => setConfirmDeleteId(o.id)}
+                                    >
+                                      <X size={14} />
+                                    </button>
+                                  )}
                                 </div>
                               </td>
                             </tr>
@@ -1058,11 +1138,12 @@ export default function WorkOrderDashboard() {
               orders={orders}
               workerNames={allWorkerNames}
               entries={timeEntries}
+              onPurge={purgeOrphanHours}
               onAdd={addTimeEntry}
               onDelete={deleteTimeEntry}
             />
           ) : (
-            <ReportsArchive history={reportHistory} />
+            <ReportsArchive history={reportHistory} onDelete={deleteReportDay} />
           )}
         </div>
       )}
@@ -1140,6 +1221,20 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
         <div className="wo-panel-head">
           <Clock size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Carry-over rollover</div>
+          <div className="wo-controls">
+            <ExportBtn
+              onClick={() =>
+                downloadCSV(
+                  `carry-over-${todayISO()}.csv`,
+                  ["ID", "Title", "Assignee", "Opened", "Days open", "Outcome today"],
+                  rolloverRows.map((o) => [
+                    o.id, o.title, o.assignee, o.createdDate, daysBetween(o.createdDate, todayISO()),
+                    o.status === "Completed" && o.closedDate === todayISO() ? "Closed today" : "Carried forward",
+                  ])
+                )
+              }
+            />
+          </div>
         </div>
         {rolloverRows.length === 0 ? (
           <div className="wo-empty">Nothing carried in from yesterday — every open order was created today.</div>
@@ -1188,6 +1283,18 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
           <AlertTriangle size={16} color={BRAND.danger} />
           <div className="wo-panel-title">Long-pending work orders</div>
           <div className="wo-controls">
+            <ExportBtn
+              onClick={() =>
+                downloadCSV(
+                  `long-pending-${todayISO()}.csv`,
+                  ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Opened", "Days open"],
+                  longPending.map((o) => [
+                    o.id, o.title, o.productCode, o.productName, o.assignee, o.priority,
+                    o.createdDate, daysBetween(o.createdDate, todayISO()),
+                  ])
+                )
+              }
+            />
             <select
               className="wo-select"
               value={pendingThreshold}
@@ -1256,6 +1363,17 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
         <div className="wo-panel-head">
           <UserCircle2 size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Worker carry-over report</div>
+          <div className="wo-controls">
+            <ExportBtn
+              onClick={() =>
+                downloadCSV(
+                  `worker-carry-over-${todayISO()}.csv`,
+                  ["Worker", "Carried from yesterday", "Closed today", "Carried forward"],
+                  workerCarryOver.map((w) => [w.name, w.inCount, w.closedCount, w.forwardCount])
+                )
+              }
+            />
+          </div>
         </div>
         {workerCarryOver.length === 0 ? (
           <div className="wo-empty">No carried-over work to report on.</div>
@@ -1467,6 +1585,23 @@ function WorkerView({ orders }) {
 
   return (
     <div>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+        <ExportBtn
+          label="Export all workers' orders"
+          onClick={() =>
+            downloadCSV(
+              `orders-by-worker-${todayISO()}.csv`,
+              ["Worker", "ID", "Title", "Product code", "Product name", "Priority", "Status", "Opened", "Due", "Closed"],
+              byWorker.flatMap((w) =>
+                w.list.map((o) => [
+                  w.name, o.id, o.title, o.productCode, o.productName, o.priority, o.status,
+                  o.createdDate, o.dueDate, o.closedDate || "",
+                ])
+              )
+            )
+          }
+        />
+      </div>
       <div className="wo-kpis" style={{ marginBottom: 18 }}>
         <div className="wo-kpi" style={{ "--accent": BRAND.gunmetal }}>
           <div className="wo-kpi-num">{byWorker.length}</div>
@@ -1584,7 +1719,7 @@ function WorkerView({ orders }) {
   );
 }
 
-function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
+function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
   const [date, setDate] = useState(todayISO());
   const [worker, setWorker] = useState("");
   const [woId, setWoId] = useState("");
@@ -1595,6 +1730,10 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
   const [to, setTo] = useState("");
 
   const workers = workerNames;
+  const orphanCount = useMemo(() => {
+    const ids = new Set(orders.map((o) => o.id));
+    return entries.filter((t) => !ids.has(t.woId)).length;
+  }, [orders, entries]);
   const orderById = useMemo(() => {
     const m = {};
     orders.forEach((o) => (m[o.id] = o));
@@ -1645,6 +1784,17 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
 
   return (
     <div>
+      {orphanCount > 0 && (
+        <div className="wo-panel" style={{ marginBottom: 16, padding: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <AlertTriangle size={16} color={BRAND.warn} />
+          <span style={{ fontSize: 13 }}>
+            {orphanCount} logged hour {orphanCount === 1 ? "entry belongs" : "entries belong"} to work orders that were deleted.
+          </span>
+          <button className="wo-btn" style={{ marginLeft: "auto" }} onClick={onPurge}>
+            Remove these entries
+          </button>
+        </div>
+      )}
       <div className="wo-kpis" style={{ marginBottom: 18 }}>
         <div className="wo-kpi" style={{ "--accent": BRAND.orange }}>
           <div className="wo-kpi-num">{fmtHours(dayTotal)}</div>
@@ -1727,6 +1877,20 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
         <div className="wo-panel-head">
           <UserCircle2 size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Daily hours — {date}</div>
+          <div className="wo-controls">
+            <ExportBtn
+              label="Export this day"
+              onClick={() =>
+                downloadCSV(
+                  `hours-${date}.csv`,
+                  ["Date", "Worker", "Work order", "Title", "Hours", "Note"],
+                  dayEntries.map((t) => [
+                    t.date, t.worker, t.woId, orderById[t.woId] ? orderById[t.woId].title : "", t.hours, t.note,
+                  ])
+                )
+              }
+            />
+          </div>
         </div>
         {dayEntries.length === 0 ? (
           <div className="wo-empty">No hours logged for this date.</div>
@@ -1784,6 +1948,47 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
           <ClipboardList size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Cumulative hours by work order</div>
           <div className="wo-controls">
+            <ExportBtn
+              label="Export summary"
+              onClick={() =>
+                downloadCSV(
+                  `hours-by-work-order-${todayISO()}.csv`,
+                  ["Work order", "Title", "Product code", "Status", "Hours by worker", "Days worked", "Total hours"],
+                  byWO.map((r) => {
+                    const o = orderById[r.woId];
+                    return [
+                      r.woId,
+                      o ? o.title : "(deleted work order)",
+                      o ? o.productCode : "",
+                      o ? o.status : "",
+                      Object.entries(r.workers)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([n, h]) => n + ": " + fmtHours(h) + " h")
+                        .join("; "),
+                      r.days.size,
+                      Math.round(r.total * 100) / 100,
+                    ];
+                  })
+                )
+              }
+            />
+            <ExportBtn
+              label="Export all entries"
+              onClick={() =>
+                downloadCSV(
+                  `hours-entries-${todayISO()}.csv`,
+                  ["Date", "Worker", "Work order", "Title", "Product code", "Hours", "Note"],
+                  [...ranged]
+                    .sort((a, b) => (a.date < b.date ? 1 : -1))
+                    .map((t) => [
+                      t.date, t.worker, t.woId,
+                      orderById[t.woId] ? orderById[t.woId].title : "",
+                      orderById[t.woId] ? orderById[t.woId].productCode : "",
+                      t.hours, t.note,
+                    ])
+                )
+              }
+            />
             <input
               type="date"
               className="wo-select"
@@ -1868,8 +2073,9 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
   );
 }
 
-function ReportsArchive({ history }) {
+function ReportsArchive({ history, onDelete }) {
   const [expandedDate, setExpandedDate] = useState(null);
+  const [confirmDate, setConfirmDate] = useState(null);
 
   const monthly = useMemo(() => {
     const map = {};
@@ -1922,6 +2128,17 @@ function ReportsArchive({ history }) {
         <div className="wo-panel-head">
           <ClipboardList size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Monthly rollup</div>
+          <div className="wo-controls">
+            <ExportBtn
+              onClick={() =>
+                downloadCSV(
+                  `monthly-report-${todayISO()}.csv`,
+                  ["Month", "Days recorded", "Opened", "Closed", "Carried forward (last day)", "Peak long-pending", "Peak overdue"],
+                  monthly.map((m) => [m.month, m.days, m.opened, m.closed, m.lastCarriedForward, m.maxLongPending, m.maxOverdue])
+                )
+              }
+            />
+          </div>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table className="wo-table">
@@ -1957,6 +2174,30 @@ function ReportsArchive({ history }) {
         <div className="wo-panel-head">
           <Clock size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Daily report records</div>
+          <div className="wo-controls">
+            <ExportBtn
+              label="Export daily records"
+              onClick={() =>
+                downloadCSV(
+                  `daily-reports-${todayISO()}.csv`,
+                  ["Date", "Total open", "Opened", "Carried in", "Closed", "Carried forward", "Long-pending", "Overdue"],
+                  sortedDaily.map((r) => [r.date, r.totalOpen, r.createdToday, r.carriedIn, r.closedToday, r.carriedForward, r.longPending, r.overdue])
+                )
+              }
+            />
+            <ExportBtn
+              label="Export worker breakdown"
+              onClick={() =>
+                downloadCSV(
+                  `daily-worker-breakdown-${todayISO()}.csv`,
+                  ["Date", "Worker", "Carried from prior day", "Closed", "Carried forward"],
+                  sortedDaily.flatMap((r) =>
+                    (r.workers || []).map((w) => [r.date, w.name, w.inCount, w.closedCount, w.forwardCount])
+                  )
+                )
+              }
+            />
+          </div>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table className="wo-table">
@@ -1994,6 +2235,26 @@ function ReportsArchive({ history }) {
                             style={{ transform: isOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}
                           />
                         </button>
+                        {confirmDate === r.date ? (
+                          <button
+                            className="wo-btn"
+                            style={{ background: BRAND.danger, padding: "3px 8px", marginLeft: 6 }}
+                            onClick={() => {
+                              onDelete(r.date);
+                              setConfirmDate(null);
+                            }}
+                          >
+                            Delete record?
+                          </button>
+                        ) : (
+                          <button
+                            className="wo-icon-btn"
+                            title="Delete this day's record"
+                            onClick={() => setConfirmDate(r.date)}
+                          >
+                            <X size={14} />
+                          </button>
+                        )}
                       </td>
                     </tr>
                     {isOpen && (
