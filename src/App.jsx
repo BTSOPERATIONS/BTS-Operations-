@@ -52,6 +52,7 @@ const STATUS_COLOR = {
 const STORAGE_KEY = "bts-work-orders-v1";
 const REPORTS_KEY = "bts-daily-report-history-v1";
 const HOURS_KEY = "bts-time-entries-v1";
+const WORKERS_KEY = "bts-worker-list-v1";
 
 function fmtHours(n) {
   return (Math.round(n * 100) / 100).toString();
@@ -203,6 +204,7 @@ export default function WorkOrderDashboard() {
   const [editingId, setEditingId] = useState(null);
   const [reportHistory, setReportHistory] = useState([]);
   const [timeEntries, setTimeEntries] = useState([]);
+  const [workerList, setWorkerList] = useState([]);
 
   // ---- load ----
   useEffect(() => {
@@ -238,6 +240,12 @@ export default function WorkOrderDashboard() {
         if (res && res.value) setTimeEntries(JSON.parse(res.value));
       } catch (e) {
         /* no hours logged yet */
+      }
+      try {
+        const res = await window.storage.get(WORKERS_KEY, true);
+        if (res && res.value) setWorkerList(JSON.parse(res.value));
+      } catch (e) {
+        /* no custom worker list yet */
       }
     })();
   }, []);
@@ -305,6 +313,57 @@ export default function WorkOrderDashboard() {
     });
     return map;
   }, [timeEntries]);
+
+  const allWorkerNames = useMemo(() => {
+    const set = new Set(workerList);
+    (orders || []).forEach((o) => {
+      if (o.assignee && o.assignee !== "Unassigned") set.add(o.assignee);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [workerList, orders]);
+
+  async function saveWorkerList(next) {
+    setWorkerList(next);
+    try {
+      await window.storage.set(WORKERS_KEY, JSON.stringify(next), true);
+    } catch (e) {
+      setSaveError(true);
+    }
+  }
+
+  function addWorker(name) {
+    const n = name.trim();
+    if (!n) return "Enter a name.";
+    if (allWorkerNames.some((w) => w.toLowerCase() === n.toLowerCase()))
+      return "That worker already exists.";
+    saveWorkerList([...allWorkerNames, n]);
+    return "";
+  }
+
+  function renameWorker(oldName, newName) {
+    const n = newName.trim();
+    if (!n) return "Name can't be empty.";
+    if (n === oldName) return "";
+    if (allWorkerNames.some((w) => w !== oldName && w.toLowerCase() === n.toLowerCase()))
+      return "That name is already used.";
+    saveWorkerList(allWorkerNames.map((w) => (w === oldName ? n : w)));
+    persist(orders.map((o) => (o.assignee === oldName ? { ...o, assignee: n } : o)));
+    persistHours(timeEntries.map((t) => (t.worker === oldName ? { ...t, worker: n } : t)));
+    const nextHist = reportHistory.map((r) => ({
+      ...r,
+      workers: (r.workers || []).map((w) => (w.name === oldName ? { ...w, name: n } : w)),
+    }));
+    setReportHistory(nextHist);
+    window.storage.set(REPORTS_KEY, JSON.stringify(nextHist), true).catch(() => {});
+    if (assigneeFilter === oldName) setAssigneeFilter(n);
+    return "";
+  }
+
+  function removeWorker(name) {
+    saveWorkerList(allWorkerNames.filter((w) => w !== name));
+    persist(orders.map((o) => (o.assignee === name ? { ...o, assignee: "Unassigned" } : o)));
+    if (assigneeFilter === name) setAssigneeFilter("All");
+  }
 
   function removeOrder(id) {
     if (!orders) return;
@@ -984,10 +1043,20 @@ export default function WorkOrderDashboard() {
               openOrders={openOrders}
             />
           ) : tab === "workers" ? (
-            <WorkerView orders={orders} />
+            <>
+              <WorkerManager
+                workers={allWorkerNames}
+                orders={orders}
+                onAdd={addWorker}
+                onRename={renameWorker}
+                onRemove={removeWorker}
+              />
+              <WorkerView orders={orders} />
+            </>
           ) : tab === "hours" ? (
             <HoursView
               orders={orders}
+              workerNames={allWorkerNames}
               entries={timeEntries}
               onAdd={addTimeEntry}
               onDelete={deleteTimeEntry}
@@ -1002,6 +1071,7 @@ export default function WorkOrderDashboard() {
         <OrderForm
           initial={orders.find((o) => o.id === editingId) || null}
           existingIds={orders.map((o) => o.id)}
+          workers={allWorkerNames}
           onCancel={() => {
             setShowForm(false);
             setEditingId(null);
@@ -1223,6 +1293,137 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
   );
 }
 
+function WorkerManager({ workers, orders, onAdd, onRename, onRemove }) {
+  const [newName, setNewName] = useState("");
+  const [editing, setEditing] = useState(null);
+  const [editValue, setEditValue] = useState("");
+  const [confirmRemove, setConfirmRemove] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  const openCounts = useMemo(() => {
+    const m = {};
+    orders.forEach((o) => {
+      if (o.status !== "Completed") m[o.assignee] = (m[o.assignee] || 0) + 1;
+    });
+    return m;
+  }, [orders]);
+
+  function add(e) {
+    e.preventDefault();
+    const err = onAdd(newName);
+    setMsg(err);
+    if (!err) setNewName("");
+  }
+
+  function saveRename(oldName) {
+    const err = onRename(oldName, editValue);
+    setMsg(err);
+    if (!err) setEditing(null);
+  }
+
+  return (
+    <div className="wo-panel" style={{ marginBottom: 16 }}>
+      <div className="wo-panel-head">
+        <UserCircle2 size={16} color={BRAND.orange} />
+        <div className="wo-panel-title">Manage workers</div>
+      </div>
+      <div style={{ padding: 16 }}>
+        <form onSubmit={add} style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <input
+            className="wo-select"
+            style={{ flex: 1, padding: "8px 10px" }}
+            placeholder="New worker name"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+          />
+          <button type="submit" className="wo-btn">
+            <Plus size={14} /> Add worker
+          </button>
+        </form>
+        {msg && <div style={{ color: BRAND.danger, fontSize: 12, marginBottom: 8 }}>{msg}</div>}
+        {workers.length === 0 ? (
+          <div className="wo-empty">No workers yet. Add one above.</div>
+        ) : (
+          <ul className="wo-report-list">
+            {workers.map((w) => (
+              <li key={w} style={{ alignItems: "center" }}>
+                {editing === w ? (
+                  <span style={{ display: "flex", gap: 6, flex: 1 }}>
+                    <input
+                      className="wo-select"
+                      style={{ flex: 1, padding: "6px 8px" }}
+                      value={editValue}
+                      autoFocus
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") saveRename(w);
+                        if (e.key === "Escape") setEditing(null);
+                      }}
+                    />
+                    <button className="wo-btn" onClick={() => saveRename(w)}>
+                      Save
+                    </button>
+                    <button className="wo-btn ghost" onClick={() => setEditing(null)}>
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <>
+                    <span>
+                      <strong>{w}</strong>{" "}
+                      <span style={{ color: BRAND.gunmetal, fontSize: 12 }}>
+                        · {openCounts[w] || 0} open
+                      </span>
+                    </span>
+                    <span style={{ display: "flex", gap: 6 }}>
+                      {confirmRemove === w ? (
+                        <>
+                          <button
+                            className="wo-btn"
+                            style={{ background: BRAND.danger }}
+                            onClick={() => {
+                              onRemove(w);
+                              setConfirmRemove(null);
+                            }}
+                          >
+                            Confirm remove (open orders become Unassigned)
+                          </button>
+                          <button className="wo-btn ghost" onClick={() => setConfirmRemove(null)}>
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            className="wo-btn ghost"
+                            onClick={() => {
+                              setEditing(w);
+                              setEditValue(w);
+                              setMsg("");
+                            }}
+                          >
+                            Rename
+                          </button>
+                          <button className="wo-btn ghost" onClick={() => setConfirmRemove(w)}>
+                            Remove
+                          </button>
+                        </>
+                      )}
+                    </span>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        <div style={{ fontSize: 11.5, color: BRAND.gunmetal, marginTop: 8 }}>
+          Renaming updates the name on all work orders, logged hours and past reports.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WorkerView({ orders }) {
   const [expanded, setExpanded] = useState(null);
 
@@ -1383,7 +1584,7 @@ function WorkerView({ orders }) {
   );
 }
 
-function HoursView({ orders, entries, onAdd, onDelete }) {
+function HoursView({ orders, workerNames, entries, onAdd, onDelete }) {
   const [date, setDate] = useState(todayISO());
   const [worker, setWorker] = useState("");
   const [woId, setWoId] = useState("");
@@ -1393,11 +1594,7 @@ function HoursView({ orders, entries, onAdd, onDelete }) {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
 
-  const workers = useMemo(
-    () =>
-      Array.from(new Set(orders.map((o) => o.assignee).filter((a) => a && a !== "Unassigned"))).sort(),
-    [orders]
-  );
+  const workers = workerNames;
   const orderById = useMemo(() => {
     const m = {};
     orders.forEach((o) => (m[o.id] = o));
@@ -1840,7 +2037,7 @@ function ReportsArchive({ history }) {
   );
 }
 
-function OrderForm({ initial, existingIds, onCancel, onSave }) {
+function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
   const [form, setForm] = useState(
     initial || {
       id: nextId(existingIds),
@@ -1920,11 +2117,16 @@ function OrderForm({ initial, existingIds, onCancel, onSave }) {
           <div className="wo-field-row">
             <div className="wo-field">
               <label>Assignee</label>
-              <input
-                value={form.assignee}
-                onChange={(e) => set("assignee", e.target.value)}
-                placeholder="Unassigned"
-              />
+              <select value={form.assignee} onChange={(e) => set("assignee", e.target.value)}>
+                <option value="Unassigned">Unassigned</option>
+                {Array.from(new Set([...workers, form.assignee]))
+                  .filter((w) => w && w !== "Unassigned")
+                  .map((w) => (
+                    <option key={w} value={w}>
+                      {w}
+                    </option>
+                  ))}
+              </select>
             </div>
             <div className="wo-field">
               <label>Priority</label>
