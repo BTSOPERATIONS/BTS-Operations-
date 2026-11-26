@@ -62,6 +62,10 @@ const STATUS_COLOR = {
 
 const STORAGE_KEY = "bts-work-orders-v1";
 const DAY_MINUTES = 480; // standard working day (8 hours)
+const SHIFT_PRESETS = [
+  { label: "6:00 am shift", start: "06:00", end: "14:00" },
+  { label: "7:00 am shift", start: "07:00", end: "15:00" },
+];
 // time that is not linked to a work order
 const NON_WO_ACTIVITIES = [
   "Cleaning",
@@ -73,6 +77,7 @@ const NON_WO_ACTIVITIES = [
 ];
 const REPORTS_KEY = "bts-daily-report-history-v1";
 const HOURS_KEY = "bts-time-entries-v1";
+const SHIFTS_KEY = "bts-shifts-v1";
 const WORKERS_KEY = "bts-worker-list-v1";
 
 function csvCell(v) {
@@ -103,6 +108,12 @@ function ExportBtn({ onClick, label = "Export CSV" }) {
       <Download size={13} /> {label}
     </button>
   );
+}
+
+function fmtClock(hhmm) {
+  if (!hhmm) return "";
+  const [h, m] = hhmm.split(":").map(Number);
+  return (h % 12 || 12) + ":" + String(m).padStart(2, "0") + " " + (h >= 12 ? "pm" : "am");
 }
 
 function fmtMin(n) {
@@ -221,6 +232,7 @@ export default function WorkOrderDashboard() {
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [expandedTimeId, setExpandedTimeId] = useState(null);
   const [pauseTargetId, setPauseTargetId] = useState(null);
+  const [shifts, setShifts] = useState([]);
 
   // ---- load ----
   useEffect(() => {
@@ -262,6 +274,12 @@ export default function WorkOrderDashboard() {
         if (res && res.value) setWorkerList(JSON.parse(res.value));
       } catch (e) {
         /* no custom worker list yet */
+      }
+      try {
+        const res = await window.storage.get(SHIFTS_KEY, true);
+        if (res && res.value) setShifts(JSON.parse(res.value));
+      } catch (e) {
+        /* no shifts recorded yet */
       }
     })();
   }, []);
@@ -336,8 +354,18 @@ export default function WorkOrderDashboard() {
     }
   }
 
+  async function persistShifts(next) {
+    setShifts(next);
+    try {
+      const res = await window.storage.set(SHIFTS_KEY, JSON.stringify(next), true);
+      setSaveError(!res);
+    } catch (e) {
+      setSaveError(true);
+    }
+  }
+
   // Save one worker's whole timesheet for one day (replaces that day's entries).
-  function saveTimesheet(date, worker, rows) {
+  function saveTimesheet(date, worker, rows, shift) {
     const kept = timeEntries.filter((t) => !(t.date === date && t.worker === worker));
     const added = rows.map((r, i) => ({
       id: "TE-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 100000),
@@ -349,6 +377,10 @@ export default function WorkOrderDashboard() {
       note: r.note || "",
     }));
     persistHours([...added, ...kept]);
+    if (shift && shift.start && shift.end) {
+      const keptShifts = shifts.filter((x) => !(x.date === date && x.worker === worker));
+      persistShifts([{ date, worker, start: shift.start, end: shift.end }, ...keptShifts]);
+    }
   }
 
   function deleteTimeEntry(id) {
@@ -404,6 +436,7 @@ export default function WorkOrderDashboard() {
       )
     );
     persistHours(timeEntries.map((t) => (t.worker === oldName ? { ...t, worker: n } : t)));
+    persistShifts(shifts.map((x) => (x.worker === oldName ? { ...x, worker: n } : x)));
     const nextHist = reportHistory.map((r) => ({
       ...r,
       workers: (r.workers || []).map((w) => (w.name === oldName ? { ...w, name: n } : w)),
@@ -1258,6 +1291,7 @@ export default function WorkOrderDashboard() {
               orders={orders}
               workerNames={allWorkerNames}
               entries={timeEntries}
+              shifts={shifts}
               onPurge={purgeOrphanHours}
               onSaveSheet={saveTimesheet}
               onDelete={deleteTimeEntry}
@@ -1934,12 +1968,14 @@ function TimeBreakdown({ entries }) {
   );
 }
 
-function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurge }) {
+function HoursView({ orders, workerNames, entries, shifts, onSaveSheet, onDelete, onPurge }) {
   const [date, setDate] = useState(todayISO());
   const [worker, setWorker] = useState("");
   const [sheet, setSheet] = useState({});
   const [filter, setFilter] = useState("");
   const [showPaused, setShowPaused] = useState(false);
+  const [shiftStart, setShiftStart] = useState("");
+  const [shiftEnd, setShiftEnd] = useState("");
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
   const [from, setFrom] = useState("");
@@ -1956,6 +1992,12 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     return entries.filter((t) => t.woId && !ids.has(t.woId)).length;
   }, [orders, entries]);
 
+  const shiftMap = useMemo(() => {
+    const m = {};
+    shifts.forEach((x) => (m[x.date + "|" + x.worker] = x));
+    return m;
+  }, [shifts]);
+
   // load the saved timesheet whenever the date or worker changes
   useEffect(() => {
     const m = {};
@@ -1967,6 +2009,9 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
         });
     }
     setSheet(m);
+    const sh = worker ? shifts.find((x) => x.date === date && x.worker === worker) : null;
+    setShiftStart(sh ? sh.start : "");
+    setShiftEnd(sh ? sh.end : "");
     setError("");
     setSaved("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1995,6 +2040,20 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
   const actTotal = tickedEntries.filter(([k]) => k.startsWith("act:")).reduce((sum, [, r]) => sum + mins(r), 0);
   const sheetTotal = woTotal + actTotal;
 
+  const toMin = (hhmm) => {
+    const [h, m] = (hhmm || "0:0").split(":").map(Number);
+    return h * 60 + m;
+  };
+  const shiftLen = shiftStart && shiftEnd ? (toMin(shiftEnd) - toMin(shiftStart) + 1440) % 1440 : 0;
+  const target = shiftLen || DAY_MINUTES;
+  const scale = Math.max(target, sheetTotal) || 1;
+  const woPct = (woTotal / scale) * 100;
+  const actPct = (actTotal / scale) * 100;
+  const left = target - sheetTotal;
+  const dayStatusColor = left === 0 ? BRAND.ok : left < 0 ? BRAND.danger : BRAND.gunmetal;
+  const dayStatusText =
+    left === 0 ? "✓ Full shift accounted for" : left < 0 ? -left + " min over the shift" : left + " min left to fill";
+
   function toggle(id) {
     setSheet((s) => {
       const cur = s[id];
@@ -2008,7 +2067,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     const others = Object.entries(sheet)
       .filter(([k, r]) => k !== key && r.on)
       .reduce((sum, [, r]) => sum + (parseInt(r.minutes, 10) || 0), 0);
-    setField(key, "minutes", String(Math.max(0, DAY_MINUTES - others)));
+    setField(key, "minutes", String(Math.max(0, target - others)));
   }
 
   function setField(id, field, value) {
@@ -2018,6 +2077,8 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
 
   function save() {
     if (!worker) return setError("Choose a worker first.");
+    if (!shiftLen)
+      return setError("Choose the shift start and end (6:00 am or 7:00 am shift, or enter your own times).");
     const out = [];
     for (const [key, r] of Object.entries(sheet)) {
       if (!r.on) continue;
@@ -2031,7 +2092,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     const total = out.reduce((sum, r) => sum + r.minutes, 0);
     if (total > 1440) return setError("A day can't exceed 1440 minutes (24 hours).");
     setError("");
-    onSaveSheet(date, worker, out);
+    onSaveSheet(date, worker, out, { start: shiftStart, end: shiftEnd });
     setSaved(
       out.length
         ? "Timesheet saved: " + out.length + " line(s), " + fmtMin(total) + "."
@@ -2113,7 +2174,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
       </div>
 
       {/* ---- daily timesheet ---- */}
-      <div className="wo-panel" style={{ marginBottom: 16 }}>
+      <div className="wo-panel" style={{ marginBottom: 16, overflow: "visible" }}>
         <div className="wo-panel-head">
           <Clock size={16} color={BRAND.orange} />
           <div className="wo-panel-title">Daily timesheet</div>
@@ -2136,9 +2197,110 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
           <div style={{ padding: 16 }}>
             <div style={{ fontSize: 12.5, color: BRAND.gunmetal, marginBottom: 10 }}>
               Tick the work orders {worker} worked on and enter the minutes for each. Time that isn't linked to a
-              work order (cleaning, meetings, leave…) goes in the second table. A standard day is {DAY_MINUTES}{" "}
-              minutes, but not every minute has to be filled in. Saving replaces this worker's timesheet for the day.
+              work order (cleaning, meetings, leave…) goes in the second table. The bar shows how much of the shift
+              is accounted for; not every minute has to be filled in. Saving replaces this worker's timesheet for
+              the day.
             </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+              <span
+                style={{ fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.3, color: BRAND.gunmetal }}
+              >
+                Shift
+              </span>
+              {SHIFT_PRESETS.map((pr) => {
+                const active = shiftStart === pr.start && shiftEnd === pr.end;
+                return (
+                  <button
+                    key={pr.label}
+                    type="button"
+                    className={active ? "wo-btn" : "wo-btn ghost"}
+                    onClick={() => {
+                      setShiftStart(pr.start);
+                      setShiftEnd(pr.end);
+                      setSaved("");
+                    }}
+                  >
+                    {pr.label}
+                  </button>
+                );
+              })}
+              <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                Start
+                <input
+                  type="time"
+                  className="wo-mini"
+                  value={shiftStart}
+                  onChange={(e) => {
+                    setShiftStart(e.target.value);
+                    setSaved("");
+                  }}
+                />
+              </label>
+              <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                End
+                <input
+                  type="time"
+                  className="wo-mini"
+                  value={shiftEnd}
+                  onChange={(e) => {
+                    setShiftEnd(e.target.value);
+                    setSaved("");
+                  }}
+                />
+              </label>
+              <span style={{ fontSize: 12, color: BRAND.gunmetal }}>
+                {shiftLen
+                  ? fmtClock(shiftStart) + " – " + fmtClock(shiftEnd) + " · " + fmtMin(shiftLen)
+                  : "Choose the shift start and end"}
+              </span>
+            </div>
+
+            <div
+              style={{
+                position: "sticky",
+                top: 0,
+                zIndex: 5,
+                background: "#fff",
+                padding: "10px 0 12px",
+                marginBottom: 12,
+                borderBottom: "1px solid " + BRAND.line,
+              }}
+            >
+              <div
+                style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 6 }}
+              >
+                <div style={{ fontWeight: 800, fontSize: 14 }}>
+                  {sheetTotal} of {target} min
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: dayStatusColor }}>{dayStatusText}</div>
+              </div>
+              <div
+                style={{ position: "relative", height: 16, background: "#EFEDEB", borderRadius: 8, overflow: "hidden", display: "flex" }}
+              >
+                <div style={{ width: woPct + "%", background: BRAND.orange, transition: "width 0.2s" }} />
+                <div style={{ width: actPct + "%", background: "#9A9B9D", transition: "width 0.2s" }} />
+                {sheetTotal > target && (
+                  <div
+                    style={{ position: "absolute", left: (target / scale) * 100 + "%", top: 0, bottom: 0, width: 2, background: BRAND.ink }}
+                  />
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 11.5, color: BRAND.gunmetal, marginTop: 6 }}>
+                <span>
+                  <span style={{ display: "inline-block", width: 9, height: 9, background: BRAND.orange, borderRadius: 2, marginRight: 4 }} />
+                  Work orders {woTotal} min
+                </span>
+                <span>
+                  <span style={{ display: "inline-block", width: 9, height: 9, background: "#9A9B9D", borderRadius: 2, marginRight: 4 }} />
+                  Other activities {actTotal} min
+                </span>
+                <span>
+                  <span style={{ display: "inline-block", width: 9, height: 9, background: "#EFEDEB", border: "1px solid #D8D5D2", borderRadius: 2, marginRight: 4 }} />
+                  Left {Math.max(0, left)} min
+                </span>
+              </div>
+            </div>
+
             <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 10 }}>
               <div className="wo-search" style={{ maxWidth: 320 }}>
                 <Search size={13} color={BRAND.gunmetal} />
@@ -2293,16 +2455,12 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
                   Total: <span style={{ color: sheetTotal > 1440 ? BRAND.danger : BRAND.orange }}>{fmtMin(sheetTotal)}</span>
                   <span style={{ fontWeight: 500, fontSize: 12, color: BRAND.gunmetal }}>
                     {" "}
-                    of a {DAY_MINUTES}-minute day
+                    of a {target}-minute shift
                   </span>
                 </div>
                 <div style={{ fontSize: 12, color: BRAND.gunmetal }}>
                   Work orders {woTotal} min · Other activities {actTotal} min ·{" "}
-                  {sheetTotal < DAY_MINUTES
-                    ? DAY_MINUTES - sheetTotal + " min not yet accounted for"
-                    : sheetTotal > DAY_MINUTES
-                    ? sheetTotal - DAY_MINUTES + " min over the standard day"
-                    : "full day accounted for"}
+                  {dayStatusText}
                 </div>
               </div>
               <button className="wo-btn" onClick={save}>
@@ -2326,10 +2484,12 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               onClick={() =>
                 downloadCSV(
                   "timesheets-" + date + ".csv",
-                  ["Date", "Worker", "Work order", "Title", "Activity (not a work order)", "Minutes", "Note"],
+                  ["Date", "Worker", "Shift start", "Shift end", "Work order", "Title", "Activity (not a work order)", "Minutes", "Note"],
                   dayEntries.map((t) => [
                     t.date,
                     t.worker,
+                    (shiftMap[t.date + "|" + t.worker] || {}).start || "",
+                    (shiftMap[t.date + "|" + t.worker] || {}).end || "",
                     t.woId || "",
                     orderById[t.woId] ? orderById[t.woId].title : "",
                     t.activity || "",
@@ -2386,7 +2546,15 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
             <ul className="wo-report-list" style={{ padding: "8px 16px", background: BRAND.paper }}>
               {dayByWorker.map(([name, m]) => (
                 <li key={name}>
-                  <span>{name} — total for the day</span>
+                  <span>
+                    {name} — total for the day
+                    {shiftMap[date + "|" + name]
+                      ? " · shift " +
+                        fmtClock(shiftMap[date + "|" + name].start) +
+                        " – " +
+                        fmtClock(shiftMap[date + "|" + name].end)
+                      : ""}
+                  </span>
                   <span style={{ fontWeight: 800 }}>{fmtMin(m)}</span>
                 </li>
               ))}
@@ -2434,12 +2602,14 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               onClick={() =>
                 downloadCSV(
                   "time-entries-" + todayISO() + ".csv",
-                  ["Date", "Worker", "Work order", "Title", "Activity (not a work order)", "Product code", "Minutes", "Note"],
+                  ["Date", "Worker", "Shift start", "Shift end", "Work order", "Title", "Activity (not a work order)", "Product code", "Minutes", "Note"],
                   [...ranged]
                     .sort((a, b) => (a.date < b.date ? 1 : -1))
                     .map((t) => [
                       t.date,
                       t.worker,
+                      (shiftMap[t.date + "|" + t.worker] || {}).start || "",
+                      (shiftMap[t.date + "|" + t.worker] || {}).end || "",
                       t.woId || "",
                       orderById[t.woId] ? orderById[t.woId].title : "",
                       t.activity || "",
