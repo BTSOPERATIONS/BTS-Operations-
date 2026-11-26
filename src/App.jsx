@@ -61,6 +61,16 @@ const STATUS_COLOR = {
 };
 
 const STORAGE_KEY = "bts-work-orders-v1";
+const DAY_MINUTES = 480; // standard working day (8 hours)
+// time that is not linked to a work order
+const NON_WO_ACTIVITIES = [
+  "Cleaning",
+  "General manufacturing",
+  "Manuals & procedures",
+  "Meeting",
+  "Leave",
+  "Other",
+];
 const REPORTS_KEY = "bts-daily-report-history-v1";
 const HOURS_KEY = "bts-time-entries-v1";
 const WORKERS_KEY = "bts-worker-list-v1";
@@ -333,7 +343,8 @@ export default function WorkOrderDashboard() {
       id: "TE-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 100000),
       date,
       worker,
-      woId: r.woId,
+      woId: r.woId || null,
+      activity: r.activity || null,
       minutes: r.minutes,
       note: r.note || "",
     }));
@@ -426,7 +437,7 @@ export default function WorkOrderDashboard() {
   function purgeOrphanHours() {
     if (!orders) return;
     const ids = new Set(orders.map((o) => o.id));
-    persistHours(timeEntries.filter((t) => ids.has(t.woId)));
+    persistHours(timeEntries.filter((t) => !t.woId || ids.has(t.woId)));
   }
 
   function deleteReportDay(date) {
@@ -1942,7 +1953,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
 
   const orphanCount = useMemo(() => {
     const ids = new Set(orders.map((o) => o.id));
-    return entries.filter((t) => !ids.has(t.woId)).length;
+    return entries.filter((t) => t.woId && !ids.has(t.woId)).length;
   }, [orders, entries]);
 
   // load the saved timesheet whenever the date or worker changes
@@ -1952,7 +1963,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
       entries
         .filter((t) => t.date === date && t.worker === worker)
         .forEach((t) => {
-          m[t.woId] = { on: true, minutes: String(t.minutes), note: t.note || "" };
+          m[t.activity ? "act:" + t.activity : t.woId] = { on: true, minutes: String(t.minutes), note: t.note || "" };
         });
     }
     setSheet(m);
@@ -1978,8 +1989,11 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
       .sort((a, b) => (a.id < b.id ? -1 : 1));
   }, [orders, sheet, filter, showPaused]);
 
-  const ticked = Object.values(sheet).filter((r) => r.on);
-  const sheetTotal = ticked.reduce((sum, r) => sum + (parseInt(r.minutes, 10) || 0), 0);
+  const tickedEntries = Object.entries(sheet).filter(([, r]) => r.on);
+  const mins = (r) => parseInt(r.minutes, 10) || 0;
+  const woTotal = tickedEntries.filter(([k]) => !k.startsWith("act:")).reduce((sum, [, r]) => sum + mins(r), 0);
+  const actTotal = tickedEntries.filter(([k]) => k.startsWith("act:")).reduce((sum, [, r]) => sum + mins(r), 0);
+  const sheetTotal = woTotal + actTotal;
 
   function toggle(id) {
     setSheet((s) => {
@@ -1990,6 +2004,13 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     setSaved("");
   }
 
+  function fillRest(key) {
+    const others = Object.entries(sheet)
+      .filter(([k, r]) => k !== key && r.on)
+      .reduce((sum, [, r]) => sum + (parseInt(r.minutes, 10) || 0), 0);
+    setField(key, "minutes", String(Math.max(0, DAY_MINUTES - others)));
+  }
+
   function setField(id, field, value) {
     setSheet((s) => ({ ...s, [id]: { ...s[id], [field]: value } }));
     setSaved("");
@@ -1998,11 +2019,14 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
   function save() {
     if (!worker) return setError("Choose a worker first.");
     const out = [];
-    for (const [woId, r] of Object.entries(sheet)) {
+    for (const [key, r] of Object.entries(sheet)) {
       if (!r.on) continue;
+      const isAct = key.startsWith("act:");
+      const label = isAct ? key.slice(4) : key;
       const m = Number(r.minutes);
-      if (!Number.isInteger(m) || m < 1) return setError("Enter whole minutes (1 or more) for " + woId + ".");
-      out.push({ woId, minutes: m, note: (r.note || "").trim() });
+      if (!Number.isInteger(m) || m < 1) return setError("Enter whole minutes (1 or more) for " + label + ".");
+      const note = (r.note || "").trim();
+      out.push(isAct ? { activity: label, minutes: m, note } : { woId: key, minutes: m, note });
     }
     const total = out.reduce((sum, r) => sum + r.minutes, 0);
     if (total > 1440) return setError("A day can't exceed 1440 minutes (24 hours).");
@@ -2010,7 +2034,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     onSaveSheet(date, worker, out);
     setSaved(
       out.length
-        ? "Timesheet saved: " + out.length + " work order(s), " + fmtMin(total) + "."
+        ? "Timesheet saved: " + out.length + " line(s), " + fmtMin(total) + "."
         : "Timesheet cleared for this worker and day."
     );
   }
@@ -2030,6 +2054,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
   const byWO = useMemo(() => {
     const m = {};
     ranged.forEach((t) => {
+      if (t.activity || !t.woId) return;
       if (!m[t.woId]) m[t.woId] = { woId: t.woId, total: 0, workers: {}, days: new Set() };
       m[t.woId].total += t.minutes;
       m[t.woId].workers[t.worker] = (m[t.woId].workers[t.worker] || 0) + t.minutes;
@@ -2038,6 +2063,17 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
     return Object.values(m).sort((a, b) => b.total - a.total);
   }, [ranged]);
   const grandTotal = byWO.reduce((sum, r) => sum + r.total, 0);
+
+  const split = useMemo(() => {
+    const m = {};
+    ranged.forEach((t) => {
+      if (!m[t.worker]) m[t.worker] = { worker: t.worker, wo: 0, acts: {}, total: 0 };
+      if (t.activity) m[t.worker].acts[t.activity] = (m[t.worker].acts[t.activity] || 0) + t.minutes;
+      else m[t.worker].wo += t.minutes;
+      m[t.worker].total += t.minutes;
+    });
+    return Object.values(m).sort((a, b) => (a.worker < b.worker ? -1 : 1));
+  }, [ranged]);
 
   return (
     <div>
@@ -2099,8 +2135,9 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
         ) : (
           <div style={{ padding: 16 }}>
             <div style={{ fontSize: 12.5, color: BRAND.gunmetal, marginBottom: 10 }}>
-              Tick the work orders {worker} worked on and enter the minutes for each. Saving replaces this
-              worker's timesheet for the day.
+              Tick the work orders {worker} worked on and enter the minutes for each. Time that isn't linked to a
+              work order (cleaning, meetings, leave…) goes in the second table. A standard day is {DAY_MINUTES}{" "}
+              minutes, but not every minute has to be filled in. Saving replaces this worker's timesheet for the day.
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 10 }}>
               <div className="wo-search" style={{ maxWidth: 320 }}>
@@ -2188,13 +2225,85 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               </div>
             )}
 
+            <div style={{ marginTop: 16 }}>
+              <div
+                style={{
+                  fontWeight: 800,
+                  fontSize: 12,
+                  textTransform: "uppercase",
+                  letterSpacing: 0.3,
+                  color: BRAND.gunmetal,
+                  marginBottom: 6,
+                }}
+              >
+                Other time (not linked to a work order)
+              </div>
+              <div style={{ overflowX: "auto", border: "1px solid " + BRAND.line, borderRadius: 6 }}>
+                <table className="wo-table">
+                  <tbody>
+                    {NON_WO_ACTIVITIES.map((a) => {
+                      const key = "act:" + a;
+                      const r = sheet[key];
+                      const on = !!(r && r.on);
+                      return (
+                        <tr key={a} style={on ? { background: "#FFF6F0" } : undefined}>
+                          <td style={{ width: 28 }}>
+                            <input type="checkbox" checked={on} onChange={() => toggle(key)} />
+                          </td>
+                          <td style={{ fontWeight: 600, whiteSpace: "nowrap" }}>{a}</td>
+                          <td style={{ whiteSpace: "nowrap" }}>
+                            <input
+                              className="wo-mini"
+                              type="number"
+                              min="1"
+                              step="1"
+                              style={{ width: 90 }}
+                              disabled={!on}
+                              value={on ? r.minutes : ""}
+                              placeholder="min"
+                              onChange={(e) => setField(key, "minutes", e.target.value)}
+                            />
+                            {on && (
+                              <button className="wo-link" style={{ marginLeft: 8 }} onClick={() => fillRest(key)}>
+                                fill rest of day
+                              </button>
+                            )}
+                          </td>
+                          <td>
+                            <input
+                              className="wo-mini"
+                              style={{ width: "100%", minWidth: 140 }}
+                              disabled={!on}
+                              value={on ? r.note : ""}
+                              placeholder="optional"
+                              onChange={(e) => setField(key, "note", e.target.value)}
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
             <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 12, flexWrap: "wrap" }}>
-              <div style={{ fontWeight: 800, fontSize: 14 }}>
-                Total: <span style={{ color: sheetTotal > 1440 ? BRAND.danger : BRAND.orange }}>{fmtMin(sheetTotal)}</span>
-                <span style={{ fontWeight: 500, fontSize: 12, color: BRAND.gunmetal }}>
-                  {" "}
-                  · {ticked.length} work order(s)
-                </span>
+              <div>
+                <div style={{ fontWeight: 800, fontSize: 14 }}>
+                  Total: <span style={{ color: sheetTotal > 1440 ? BRAND.danger : BRAND.orange }}>{fmtMin(sheetTotal)}</span>
+                  <span style={{ fontWeight: 500, fontSize: 12, color: BRAND.gunmetal }}>
+                    {" "}
+                    of a {DAY_MINUTES}-minute day
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, color: BRAND.gunmetal }}>
+                  Work orders {woTotal} min · Other activities {actTotal} min ·{" "}
+                  {sheetTotal < DAY_MINUTES
+                    ? DAY_MINUTES - sheetTotal + " min not yet accounted for"
+                    : sheetTotal > DAY_MINUTES
+                    ? sheetTotal - DAY_MINUTES + " min over the standard day"
+                    : "full day accounted for"}
+                </div>
               </div>
               <button className="wo-btn" onClick={save}>
                 Save timesheet
@@ -2217,12 +2326,13 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               onClick={() =>
                 downloadCSV(
                   "timesheets-" + date + ".csv",
-                  ["Date", "Worker", "Work order", "Title", "Minutes", "Note"],
+                  ["Date", "Worker", "Work order", "Title", "Activity (not a work order)", "Minutes", "Note"],
                   dayEntries.map((t) => [
                     t.date,
                     t.worker,
-                    t.woId,
+                    t.woId || "",
                     orderById[t.woId] ? orderById[t.woId].title : "",
+                    t.activity || "",
                     t.minutes,
                     t.note,
                   ])
@@ -2247,12 +2357,20 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               </thead>
               <tbody>
                 {[...dayEntries]
-                  .sort((a, b) => (a.worker < b.worker ? -1 : a.worker > b.worker ? 1 : a.woId < b.woId ? -1 : 1))
+                  .sort((a, b) => (a.worker < b.worker ? -1 : a.worker > b.worker ? 1 : (a.woId || "~" + a.activity) < (b.woId || "~" + b.activity) ? -1 : 1))
                   .map((t) => (
                     <tr key={t.id}>
                       <td>{t.worker}</td>
                       <td>
-                        <span className="wo-id">{t.woId}</span> {orderById[t.woId] ? orderById[t.woId].title : ""}
+                        {t.activity ? (
+                          <span style={{ fontWeight: 600 }}>
+                            {t.activity} <span style={{ color: BRAND.gunmetal, fontWeight: 400 }}>(not a work order)</span>
+                          </span>
+                        ) : (
+                          <>
+                            <span className="wo-id">{t.woId}</span> {orderById[t.woId] ? orderById[t.woId].title : ""}
+                          </>
+                        )}
                       </td>
                       <td style={{ fontWeight: 700 }}>{t.minutes} min</td>
                       <td style={{ color: BRAND.gunmetal, fontSize: 12 }}>{t.note}</td>
@@ -2316,14 +2434,15 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               onClick={() =>
                 downloadCSV(
                   "time-entries-" + todayISO() + ".csv",
-                  ["Date", "Worker", "Work order", "Title", "Product code", "Minutes", "Note"],
+                  ["Date", "Worker", "Work order", "Title", "Activity (not a work order)", "Product code", "Minutes", "Note"],
                   [...ranged]
                     .sort((a, b) => (a.date < b.date ? 1 : -1))
                     .map((t) => [
                       t.date,
                       t.worker,
-                      t.woId,
+                      t.woId || "",
                       orderById[t.woId] ? orderById[t.woId].title : "",
+                      t.activity || "",
                       orderById[t.woId] ? orderById[t.woId].productCode : "",
                       t.minutes,
                       t.note,
@@ -2396,6 +2515,65 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
                 </tr>
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+
+      <div className="wo-panel" style={{ marginTop: 16 }}>
+        <div className="wo-panel-head">
+          <UserCircle2 size={16} color={BRAND.orange} />
+          <div className="wo-panel-title">Work orders vs other activities</div>
+          <div className="wo-controls">
+            <ExportBtn
+              onClick={() =>
+                downloadCSV(
+                  "time-by-category-" + todayISO() + ".csv",
+                  ["Worker", "Work orders (min)", ...NON_WO_ACTIVITIES.map((a) => a + " (min)"), "Total (min)", "% on work orders"],
+                  split.map((r) => [
+                    r.worker,
+                    r.wo,
+                    ...NON_WO_ACTIVITIES.map((a) => r.acts[a] || 0),
+                    r.total,
+                    r.total ? Math.round((r.wo * 100) / r.total) : 0,
+                  ])
+                )
+              }
+            />
+          </div>
+        </div>
+        {split.length === 0 ? (
+          <div className="wo-empty">No time recorded in this range.</div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table className="wo-table">
+              <thead>
+                <tr>
+                  <th>Worker</th>
+                  <th>Work orders</th>
+                  {NON_WO_ACTIVITIES.map((a) => (
+                    <th key={a}>{a}</th>
+                  ))}
+                  <th>Total</th>
+                  <th>% on work orders</th>
+                </tr>
+              </thead>
+              <tbody>
+                {split.map((r) => (
+                  <tr key={r.worker}>
+                    <td style={{ fontWeight: 600 }}>{r.worker}</td>
+                    <td style={{ fontWeight: 700, color: BRAND.orange }}>{r.wo} min</td>
+                    {NON_WO_ACTIVITIES.map((a) => (
+                      <td key={a}>{r.acts[a] ? r.acts[a] + " min" : "—"}</td>
+                    ))}
+                    <td style={{ fontWeight: 700 }}>{fmtMin(r.total)}</td>
+                    <td>{r.total ? Math.round((r.wo * 100) / r.total) + "%" : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ fontSize: 11.5, color: BRAND.gunmetal, padding: "8px 16px" }}>
+              Uses the From / To dates above (all time if empty).
+            </div>
           </div>
         )}
       </div>
