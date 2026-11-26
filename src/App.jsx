@@ -2631,7 +2631,7 @@ function ReportsArchive({ history, onDelete }) {
 function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
   const [form, setForm] = useState(
     (initial && normalizeOrder(initial)) || {
-      id: nextId(existingIds),
+      id: "",
       title: "",
       productCode: "",
       productName: "",
@@ -2644,13 +2644,9 @@ function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
     }
   );
 
-  function nextId(ids) {
-    const nums = ids
-      .map((id) => parseInt(id.replace("WO-", ""), 10))
-      .filter((n) => !isNaN(n));
-    const max = nums.length ? Math.max(...nums) : 1000;
-    return `WO-${max + 1}`;
-  }
+  // The "WO-" prefix is fixed; the number is typed in by the user.
+  const [idNumber, setIdNumber] = useState(initial ? initial.id.replace(/^WO-/i, "") : "");
+  const [idError, setIdError] = useState("");
 
   function set(field, value) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -2659,7 +2655,27 @@ function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
   function submit(e) {
     e.preventDefault();
     if (!form.title.trim()) return;
-    onSave(form);
+    if (initial) {
+      onSave(form);
+      return;
+    }
+    const num = idNumber.trim();
+    if (!/^\d+$/.test(num)) {
+      setIdError("Enter the work order number using digits only, e.g. 1045.");
+      return;
+    }
+    const id = "WO-" + num;
+    const taken = existingIds.some(
+      (x) =>
+        x.toLowerCase() === id.toLowerCase() ||
+        (/^WO-\d+$/i.test(x) && parseInt(x.slice(3), 10) === parseInt(num, 10))
+    );
+    if (taken) {
+      setIdError(id + " already exists. Use a different number.");
+      return;
+    }
+    setIdError("");
+    onSave({ ...form, id });
   }
 
   return (
@@ -2678,6 +2694,44 @@ function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
           </button>
         </div>
         <form onSubmit={submit}>
+          <div className="wo-field">
+            <label>Work order number</label>
+            <div style={{ display: "flex", alignItems: "stretch" }}>
+              <span
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  padding: "0 10px",
+                  background: BRAND.paper,
+                  border: "1px solid " + BRAND.line,
+                  borderRight: "none",
+                  borderRadius: "5px 0 0 5px",
+                  fontWeight: 800,
+                  fontSize: 13,
+                }}
+              >
+                WO-
+              </span>
+              <input
+                style={{ flex: 1, width: "auto", minWidth: 0, borderRadius: "0 5px 5px 0" }}
+                value={idNumber}
+                disabled={!!initial}
+                inputMode="numeric"
+                placeholder="e.g. 1045"
+                required
+                onChange={(e) => {
+                  setIdNumber(e.target.value.replace(/\D/g, ""));
+                  setIdError("");
+                }}
+              />
+            </div>
+            {idError && <div style={{ color: BRAND.danger, fontSize: 12, marginTop: 4 }}>{idError}</div>}
+            {initial && (
+              <div style={{ fontSize: 11.5, color: BRAND.gunmetal, marginTop: 4 }}>
+                The number can't be changed after the work order is created.
+              </div>
+            )}
+          </div>
           <div className="wo-field">
             <label>Title</label>
             <input
