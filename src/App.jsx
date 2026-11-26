@@ -14,6 +14,8 @@ import {
   Search,
   Package,
   Download,
+  Pause,
+  Play,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -34,7 +36,15 @@ const BRAND = {
 };
 
 const PRIORITIES = ["Urgent", "High", "Medium", "Low"];
-const STATUSES = ["Open", "In Progress", "On Hold", "Completed"];
+const STATUSES = ["Open", "In Progress", "Paused", "Completed"];
+const PAUSE_REASONS = [
+  "Waiting for parts",
+  "Waiting for customer",
+  "Waiting for site access",
+  "Waiting for approval",
+  "Weather",
+  "Other",
+];
 
 const PRIORITY_COLOR = {
   Urgent: BRAND.danger,
@@ -46,7 +56,7 @@ const PRIORITY_COLOR = {
 const STATUS_COLOR = {
   Open: BRAND.gunmetal,
   "In Progress": BRAND.info,
-  "On Hold": BRAND.warn,
+  Paused: BRAND.warn,
   Completed: BRAND.ok,
 };
 
@@ -108,7 +118,45 @@ function workerNamesOf(o) {
 }
 function normalizeOrder(o) {
   const { assignee, ...rest } = o;
-  return { ...rest, assignees: getAssignees(o) };
+  return {
+    ...rest,
+    status: o.status === "On Hold" ? "Paused" : o.status,
+    pauses: Array.isArray(o.pauses) ? o.pauses : [],
+    assignees: getAssignees(o),
+  };
+}
+
+// ---- pause tracking ----
+// While paused, an order does not count as overdue or long-pending.
+function isOverdueOrder(o) {
+  return o.status !== "Completed" && o.status !== "Paused" && o.dueDate < todayISO();
+}
+function activePause(o) {
+  const list = o.pauses || [];
+  for (let i = list.length - 1; i >= 0; i--) if (!list[i].to) return list[i];
+  return null;
+}
+function pauseDays(p) {
+  return daysBetween(p.from, p.to || todayISO());
+}
+function totalPausedDays(o) {
+  return (o.pauses || []).reduce((sum, p) => sum + pauseDays(p), 0);
+}
+// keeps the pause history in step with status changes
+function trackPause(prev, next, reason, note) {
+  const pauses = ((prev && prev.pauses) || []).map((p) => ({ ...p }));
+  const wasPaused = !!prev && prev.status === "Paused";
+  const isPaused = next.status === "Paused";
+  if (!wasPaused && isPaused) {
+    pauses.push({ from: todayISO(), to: null, reason: reason || "Not specified", note: note || "" });
+  }
+  if (wasPaused && !isPaused) {
+    const last = pauses[pauses.length - 1];
+    if (last && !last.to) last.to = todayISO();
+  }
+  let statusBeforePause = null;
+  if (isPaused) statusBeforePause = wasPaused ? prev.statusBeforePause || null : (prev && prev.status) || null;
+  return { ...next, pauses, statusBeforePause };
 }
 // Time is recorded in minutes. Old entries stored in hours are converted.
 function normalizeEntry(t) {
@@ -162,6 +210,7 @@ export default function WorkOrderDashboard() {
   const [workerList, setWorkerList] = useState([]);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [expandedTimeId, setExpandedTimeId] = useState(null);
+  const [pauseTargetId, setPauseTargetId] = useState(null);
 
   // ---- load ----
   useEffect(() => {
@@ -225,22 +274,44 @@ export default function WorkOrderDashboard() {
       order.status === "Completed"
         ? { ...order, closedDate: (prior && prior.closedDate) || order.closedDate || todayISO() }
         : { ...order, closedDate: null };
+    const tracked = trackPause(prior, withClosedDate);
     const next = exists
-      ? orders.map((o) => (o.id === order.id ? withClosedDate : o))
-      : [withClosedDate, ...orders];
+      ? orders.map((o) => (o.id === order.id ? tracked : o))
+      : [tracked, ...orders];
     persist(next);
     setShowForm(false);
     setEditingId(null);
+  }
+
+  function pauseOrder(id, reason, note) {
+    if (!orders) return;
+    persist(
+      orders.map((o) =>
+        o.id === id ? trackPause(o, { ...o, status: "Paused", closedDate: null }, reason, note) : o
+      )
+    );
+    setPauseTargetId(null);
+  }
+
+  function resumeOrder(id) {
+    const o = orders && orders.find((x) => x.id === id);
+    if (!o) return;
+    const back =
+      o.statusBeforePause && o.statusBeforePause !== "Paused" && o.statusBeforePause !== "Completed"
+        ? o.statusBeforePause
+        : "Open";
+    setStatus(id, back);
   }
 
   function setStatus(id, status) {
     if (!orders) return;
     const next = orders.map((o) => {
       if (o.id !== id) return o;
-      if (status === "Completed") {
-        return { ...o, status, closedDate: o.closedDate || todayISO() };
-      }
-      return { ...o, status, closedDate: null };
+      const base =
+        status === "Completed"
+          ? { ...o, status, closedDate: o.closedDate || todayISO() }
+          : { ...o, status, closedDate: null };
+      return trackPause(o, base);
     });
     persist(next);
   }
@@ -378,12 +449,12 @@ export default function WorkOrderDashboard() {
 
   const overdue = useMemo(
     () =>
-      openOrders.filter((o) => o.dueDate < todayISO() && o.status !== "Completed"),
+      openOrders.filter(isOverdueOrder),
     [openOrders]
   );
 
   const dueToday = useMemo(
-    () => openOrders.filter((o) => o.dueDate === todayISO()),
+    () => openOrders.filter((o) => o.dueDate === todayISO() && o.status !== "Paused"),
     [openOrders]
   );
 
@@ -454,7 +525,7 @@ export default function WorkOrderDashboard() {
   }, [carriedIn, closedToday, carriedForward]);
 
   const longPendingCount = useMemo(
-    () => (orders || []).filter((o) => o.status !== "Completed" && daysBetween(o.createdDate, todayISO()) >= 3).length,
+    () => (orders || []).filter((o) => o.status !== "Completed" && o.status !== "Paused" && daysBetween(o.createdDate, todayISO()) >= 3).length,
     [orders]
   );
 
@@ -881,6 +952,15 @@ export default function WorkOrderDashboard() {
                   <div className="wo-kpi-num">{unassigned.length}</div>
                   <div className="wo-kpi-label">Unassigned</div>
                 </div>
+                <div
+                  className="wo-kpi"
+                  style={{ "--accent": BRAND.warn, cursor: "pointer" }}
+                  title="Show paused work orders"
+                  onClick={() => setStatusFilter("Paused")}
+                >
+                  <div className="wo-kpi-num">{openOrders.filter((o) => o.status === "Paused").length}</div>
+                  <div className="wo-kpi-label">Paused</div>
+                </div>
                 <div className="wo-kpi" style={{ "--accent": BRAND.info }}>
                   <div className="wo-kpi-num" style={{ fontSize: 18, lineHeight: 1.2 }}>
                     {fmtMin(openManMinutes)}
@@ -933,9 +1013,12 @@ export default function WorkOrderDashboard() {
                       onClick={() =>
                         downloadCSV(
                           `work-orders-${todayISO()}.csv`,
-                          ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Status", "Opened", "Due", "Closed", "Minutes logged", "Notes"],
+                          ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Status", "Pause reason", "Paused since", "Days paused (total)", "Opened", "Due", "Closed", "Minutes logged", "Notes"],
                           filtered.map((o) => [
                             o.id, o.title, o.productCode, o.productName, assigneeText(o), o.priority, o.status,
+                            o.status === "Paused" && activePause(o) ? activePause(o).reason : "",
+                            o.status === "Paused" && activePause(o) ? activePause(o).from : "",
+                            totalPausedDays(o) || "",
                             o.createdDate, o.dueDate, o.closedDate || "",
                             minutesByWO[o.id] || "",
                             o.notes,
@@ -976,7 +1059,7 @@ export default function WorkOrderDashboard() {
                       </thead>
                       <tbody>
                         {filtered.map((o) => {
-                          const isOverdue = o.dueDate < todayISO() && o.status !== "Completed";
+                          const isOverdue = isOverdueOrder(o);
                           return (
                             <Fragment key={o.id}>
                             <tr>
@@ -1025,7 +1108,11 @@ export default function WorkOrderDashboard() {
                                   className="wo-status-select"
                                   value={o.status}
                                   style={{ color: STATUS_COLOR[o.status] }}
-                                  onChange={(e) => setStatus(o.id, e.target.value)}
+                                  onChange={(e) =>
+                                    e.target.value === "Paused"
+                                      ? setPauseTargetId(o.id)
+                                      : setStatus(o.id, e.target.value)
+                                  }
                                 >
                                   {STATUSES.map((s) => (
                                     <option key={s} value={s}>
@@ -1033,6 +1120,20 @@ export default function WorkOrderDashboard() {
                                     </option>
                                   ))}
                                 </select>
+                                {o.status === "Paused" &&
+                                  (() => {
+                                    const pz = activePause(o);
+                                    return (
+                                      <div style={{ fontSize: 11.5, color: BRAND.warn, marginTop: 4 }}>
+                                        Paused
+                                        {pz ? " since " + pz.from + " · " + pauseDays(pz) + " day(s)" : ""}
+                                        {pz && pz.reason ? " — " + pz.reason : ""}
+                                        {pz && pz.note ? (
+                                          <div style={{ color: BRAND.gunmetal }}>{pz.note}</div>
+                                        ) : null}
+                                      </div>
+                                    );
+                                  })()}
                               </td>
                               <td>{o.createdDate}</td>
                               <td>
@@ -1064,6 +1165,15 @@ export default function WorkOrderDashboard() {
                                   >
                                     <FileText size={14} />
                                   </button>
+                                  {o.status === "Paused" ? (
+                                    <button className="wo-icon-btn" title="Resume" onClick={() => resumeOrder(o.id)}>
+                                      <Play size={14} />
+                                    </button>
+                                  ) : o.status !== "Completed" ? (
+                                    <button className="wo-icon-btn" title="Pause" onClick={() => setPauseTargetId(o.id)}>
+                                      <Pause size={14} />
+                                    </button>
+                                  ) : null}
                                   {confirmDeleteId === o.id ? (
                                     <>
                                       <button
@@ -1147,6 +1257,13 @@ export default function WorkOrderDashboard() {
         </div>
       )}
 
+      {pauseTargetId && orders && orders.find((o) => o.id === pauseTargetId) && (
+        <PauseModal
+          order={orders.find((o) => o.id === pauseTargetId)}
+          onCancel={() => setPauseTargetId(null)}
+          onConfirm={(reason, note) => pauseOrder(pauseTargetId, reason, note)}
+        />
+      )}
       {showForm && (
         <OrderForm
           initial={orders.find((o) => o.id === editingId) || null}
@@ -1169,7 +1286,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
   const longPending = useMemo(
     () =>
       (orders || [])
-        .filter((o) => o.status !== "Completed" && daysBetween(o.createdDate, todayISO()) >= pendingThreshold)
+        .filter((o) => o.status !== "Completed" && o.status !== "Paused" && daysBetween(o.createdDate, todayISO()) >= pendingThreshold)
         .sort((a, b) => daysBetween(b.createdDate, todayISO()) - daysBetween(a.createdDate, todayISO())),
     [orders, pendingThreshold]
   );
@@ -1209,6 +1326,10 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
           <div className="wo-kpi-num">{carriedForward.length}</div>
           <div className="wo-kpi-label">Carried to tomorrow</div>
         </div>
+        <div className="wo-kpi" style={{ "--accent": BRAND.warn }}>
+          <div className="wo-kpi-num">{openOrders.filter((o) => o.status === "Paused").length}</div>
+          <div className="wo-kpi-label">Paused (not counted overdue)</div>
+        </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.danger }}>
           <div className="wo-kpi-num">{longPending.length}</div>
           <div className="wo-kpi-label">Long-pending ({pendingThreshold}+ days)</div>
@@ -1228,7 +1349,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                   ["ID", "Title", "Assignee", "Opened", "Days open", "Outcome today"],
                   rolloverRows.map((o) => [
                     o.id, o.title, assigneeText(o), o.createdDate, daysBetween(o.createdDate, todayISO()),
-                    o.status === "Completed" && o.closedDate === todayISO() ? "Closed today" : "Carried forward",
+                    o.status === "Completed" && o.closedDate === todayISO() ? "Closed today" : o.status === "Paused" ? "Paused" : "Carried forward",
                   ])
                 )
               }
@@ -1263,6 +1384,8 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                       <td>
                         {wasClosedToday ? (
                           <span style={{ color: BRAND.ok, fontWeight: 700, fontSize: 12 }}>Closed today</span>
+                        ) : o.status === "Paused" ? (
+                          <span style={{ color: BRAND.warn, fontWeight: 700, fontSize: 12 }}>Paused</span>
                         ) : (
                           <span style={{ color: BRAND.warn, fontWeight: 700, fontSize: 12 }}>Carried forward</span>
                         )}
@@ -1556,11 +1679,9 @@ function WorkerView({ orders }) {
       .map(([name, list]) => {
         const open = list.filter((o) => o.status === "Open").length;
         const inProgress = list.filter((o) => o.status === "In Progress").length;
-        const onHold = list.filter((o) => o.status === "On Hold").length;
+        const paused = list.filter((o) => o.status === "Paused").length;
         const completed = list.filter((o) => o.status === "Completed").length;
-        const overdue = list.filter(
-          (o) => o.status !== "Completed" && o.dueDate < todayISO()
-        ).length;
+        const overdue = list.filter(isOverdueOrder).length;
         const sorted = [...list].sort((a, b) =>
           a.status === "Completed" && b.status !== "Completed"
             ? 1
@@ -1570,9 +1691,9 @@ function WorkerView({ orders }) {
             ? -1
             : 1
         );
-        return { name, list: sorted, open, inProgress, onHold, completed, overdue, total: list.length };
+        return { name, list: sorted, open, inProgress, paused, completed, overdue, total: list.length };
       })
-      .sort((a, b) => (b.open + b.inProgress + b.onHold) - (a.open + a.inProgress + a.onHold));
+      .sort((a, b) => (b.open + b.inProgress + b.paused) - (a.open + a.inProgress + a.paused));
   }, [orders]);
 
   if (byWorker.length === 0) {
@@ -1614,7 +1735,7 @@ function WorkerView({ orders }) {
           <div className="wo-kpi-label">Total active orders</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.danger }}>
-          <div className="wo-kpi-num">{(orders || []).filter((o) => o.status !== "Completed" && o.dueDate < todayISO()).length}</div>
+          <div className="wo-kpi-num">{(orders || []).filter(isOverdueOrder).length}</div>
           <div className="wo-kpi-label">Overdue across team</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.ok }}>
@@ -1637,7 +1758,7 @@ function WorkerView({ orders }) {
                 <span className="wo-worker-stats">
                   <span title="Open" style={{ color: STATUS_COLOR.Open }}>{w.open} open</span>
                   <span title="In progress" style={{ color: STATUS_COLOR["In Progress"] }}>{w.inProgress} in progress</span>
-                  <span title="On hold" style={{ color: STATUS_COLOR["On Hold"] }}>{w.onHold} on hold</span>
+                  <span title="Paused" style={{ color: STATUS_COLOR.Paused }}>{w.paused} paused</span>
                   <span title="Completed" style={{ color: STATUS_COLOR.Completed }}>{w.completed} completed</span>
                   {w.overdue > 0 && (
                     <span style={{ color: BRAND.danger, fontWeight: 700 }}>{w.overdue} overdue</span>
@@ -1670,7 +1791,7 @@ function WorkerView({ orders }) {
                     </thead>
                     <tbody>
                       {w.list.map((o) => {
-                        const isOverdue = o.dueDate < todayISO() && o.status !== "Completed";
+                        const isOverdue = isOverdueOrder(o);
                         return (
                           <tr key={o.id}>
                             <td className="wo-id">{o.id}</td>
@@ -1714,6 +1835,49 @@ function WorkerView({ orders }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function PauseModal({ order, onCancel, onConfirm }) {
+  const [reason, setReason] = useState(PAUSE_REASONS[0]);
+  const [note, setNote] = useState("");
+  return (
+    <div className="wo-modal-backdrop" onClick={onCancel}>
+      <div className="wo-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="wo-modal-head">
+          <div className="wo-modal-title">Pause {order.id}</div>
+          <button className="wo-icon-btn" style={{ marginLeft: "auto" }} onClick={onCancel}>
+            <X size={16} />
+          </button>
+        </div>
+        <div style={{ fontSize: 13, marginBottom: 12 }}>{order.title}</div>
+        <div className="wo-field">
+          <label>Reason</label>
+          <select value={reason} onChange={(e) => setReason(e.target.value)}>
+            {PAUSE_REASONS.map((r) => (
+              <option key={r} value={r}>
+                {r}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="wo-field">
+          <label>Note (optional)</label>
+          <textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Any details" />
+        </div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button className="wo-btn ghost" onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="wo-btn" onClick={() => onConfirm(reason, note.trim())}>
+            Pause work order
+          </button>
+        </div>
+        <div style={{ fontSize: 11.5, color: BRAND.gunmetal, marginTop: 10 }}>
+          While paused, this work order won't count as overdue or long-pending.
+        </div>
       </div>
     </div>
   );
@@ -1764,6 +1928,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
   const [worker, setWorker] = useState("");
   const [sheet, setSheet] = useState({});
   const [filter, setFilter] = useState("");
+  const [showPaused, setShowPaused] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
   const [from, setFrom] = useState("");
@@ -1799,7 +1964,10 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
   const rows = useMemo(() => {
     const q = filter.trim().toLowerCase();
     return orders
-      .filter((o) => o.status !== "Completed" || (sheet[o.id] && sheet[o.id].on))
+      .filter(
+        (o) =>
+          (o.status !== "Completed" && (showPaused || o.status !== "Paused")) || (sheet[o.id] && sheet[o.id].on)
+      )
       .filter(
         (o) =>
           !q ||
@@ -1808,7 +1976,7 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
             .some((f) => f.toLowerCase().includes(q))
       )
       .sort((a, b) => (a.id < b.id ? -1 : 1));
-  }, [orders, sheet, filter]);
+  }, [orders, sheet, filter, showPaused]);
 
   const ticked = Object.values(sheet).filter((r) => r.on);
   const sheetTotal = ticked.reduce((sum, r) => sum + (parseInt(r.minutes, 10) || 0), 0);
@@ -1934,14 +2102,20 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
               Tick the work orders {worker} worked on and enter the minutes for each. Saving replaces this
               worker's timesheet for the day.
             </div>
-            <div className="wo-search" style={{ marginBottom: 10, maxWidth: 320 }}>
-              <Search size={13} color={BRAND.gunmetal} />
-              <input
-                className="wo-search-input"
-                placeholder="Filter work orders…"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-              />
+            <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 10 }}>
+              <div className="wo-search" style={{ maxWidth: 320 }}>
+                <Search size={13} color={BRAND.gunmetal} />
+                <input
+                  className="wo-search-input"
+                  placeholder="Filter work orders…"
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                />
+              </div>
+              <label style={{ fontSize: 12.5, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                <input type="checkbox" checked={showPaused} onChange={(e) => setShowPaused(e.target.checked)} />
+                Show paused work orders
+              </label>
             </div>
 
             {rows.length === 0 ? (
@@ -1970,6 +2144,11 @@ function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurg
                           <td>
                             <div>
                               <span className="wo-id">{o.id}</span> <span className="wo-title">{o.title}</span>
+                              {o.status === "Paused" && (
+                                <span className="wo-pill" style={{ background: STATUS_COLOR.Paused, marginLeft: 8 }}>
+                                  Paused
+                                </span>
+                              )}
                             </div>
                             {(o.productCode || o.productName) && (
                               <div style={{ fontSize: 11.5, color: BRAND.gunmetal }}>
