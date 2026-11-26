@@ -85,8 +85,36 @@ function ExportBtn({ onClick, label = "Export CSV" }) {
   );
 }
 
-function fmtHours(n) {
-  return (Math.round(n * 100) / 100).toString();
+function fmtMin(n) {
+  const m = Math.round(n || 0);
+  if (m < 60) return m + " min";
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  return m + " min (" + h + "h" + (r ? " " + r + "m" : "") + ")";
+}
+
+// A work order can have several assigned workers (assignees: []).
+function getAssignees(o) {
+  if (Array.isArray(o.assignees)) return o.assignees;
+  return o.assignee && o.assignee !== "Unassigned" ? [o.assignee] : [];
+}
+function assigneeText(o) {
+  const a = getAssignees(o);
+  return a.length ? a.join(", ") : "Unassigned";
+}
+function workerNamesOf(o) {
+  const a = getAssignees(o);
+  return a.length ? a : ["Unassigned"];
+}
+function normalizeOrder(o) {
+  const { assignee, ...rest } = o;
+  return { ...rest, assignees: getAssignees(o) };
+}
+// Time is recorded in minutes. Old entries stored in hours are converted.
+function normalizeEntry(t) {
+  if (typeof t.minutes === "number") return t;
+  const { hours, ...rest } = t;
+  return { ...rest, minutes: Math.round((hours || 0) * 60) };
 }
 
 function monthKey(isoDate) {
@@ -113,112 +141,8 @@ function daysBetween(isoStart, isoEnd) {
 }
 
 function seedOrders() {
-  return [
-    {
-      id: "WO-1042",
-      title: "Replace failed switch — Rack 4, Server Room B",
-      productCode: "NET-SW24",
-      productName: "24-Port Managed Switch",
-      assignee: "M. Alvarez",
-      priority: "Urgent",
-      status: "In Progress",
-      createdDate: daysFromNow(-2),
-      dueDate: todayISO(),
-      closedDate: null,
-      notes: "Customer reported intermittent outages since Tuesday.",
-    },
-    {
-      id: "WO-1043",
-      title: "Install new POS terminals — Riverside branch",
-      productCode: "POS-T410",
-      productName: "POS Terminal T410",
-      assignee: "J. Chen",
-      priority: "Medium",
-      status: "Open",
-      createdDate: daysFromNow(-1),
-      dueDate: daysFromNow(3),
-      closedDate: null,
-      notes: "",
-    },
-    {
-      id: "WO-1044",
-      title: "Firmware update — fleet routers",
-      productCode: "NET-RT8",
-      productName: "Gigabit Fleet Router",
-      assignee: "Unassigned",
-      priority: "Low",
-      status: "Open",
-      createdDate: todayISO(),
-      dueDate: daysFromNow(7),
-      closedDate: null,
-      notes: "Batch job, can run overnight.",
-    },
-    {
-      id: "WO-1045",
-      title: "Fiber cut repair — Elm St junction",
-      productCode: "FIB-SM09",
-      productName: "Single-Mode Fiber Line",
-      assignee: "R. Okafor",
-      priority: "Urgent",
-      status: "Open",
-      createdDate: todayISO(),
-      dueDate: todayISO(),
-      closedDate: null,
-      notes: "Backhoe strike reported by client at 8:10am.",
-    },
-    {
-      id: "WO-1039",
-      title: "Quarterly UPS battery check — HQ",
-      productCode: "PWR-UPS3K",
-      productName: "3kVA UPS Unit",
-      assignee: "M. Alvarez",
-      priority: "Medium",
-      status: "On Hold",
-      createdDate: daysFromNow(-6),
-      dueDate: daysFromNow(-1),
-      closedDate: null,
-      notes: "Waiting on replacement battery shipment.",
-    },
-    {
-      id: "WO-1040",
-      title: "Patch VPN concentrator — HQ",
-      productCode: "NET-VPN2",
-      productName: "VPN Concentrator",
-      assignee: "R. Okafor",
-      priority: "High",
-      status: "Completed",
-      createdDate: daysFromNow(-1),
-      dueDate: todayISO(),
-      closedDate: todayISO(),
-      notes: "Closed out this morning after overnight patch window.",
-    },
-    {
-      id: "WO-1041",
-      title: "Diagnose slow WiFi — Warehouse 2",
-      productCode: "NET-AP12",
-      productName: "Wireless Access Point",
-      assignee: "J. Chen",
-      priority: "Medium",
-      status: "In Progress",
-      createdDate: daysFromNow(-9),
-      dueDate: daysFromNow(-4),
-      closedDate: null,
-      notes: "Long-running — waiting on replacement antenna part.",
-    },
-    {
-      id: "WO-1038",
-      title: "Reset & re-image loaner laptops",
-      productCode: "LT-ELB14",
-      productName: "Elite Laptop 14-inch",
-      assignee: "J. Chen",
-      priority: "Low",
-      status: "Completed",
-      createdDate: daysFromNow(-5),
-      dueDate: daysFromNow(-3),
-      closedDate: daysFromNow(-3),
-      notes: "",
-    },
-  ];
+  // Start with a clean, empty system (no sample work orders).
+  return [];
 }
 
 /* ------------------------------------------------------------------ */
@@ -237,6 +161,7 @@ export default function WorkOrderDashboard() {
   const [timeEntries, setTimeEntries] = useState([]);
   const [workerList, setWorkerList] = useState([]);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [expandedTimeId, setExpandedTimeId] = useState(null);
 
   // ---- load ----
   useEffect(() => {
@@ -244,7 +169,7 @@ export default function WorkOrderDashboard() {
       try {
         const res = await window.storage.get(STORAGE_KEY, true);
         if (res && res.value) {
-          setOrders(JSON.parse(res.value));
+          setOrders(JSON.parse(res.value).map(normalizeOrder));
         } else {
           const seed = seedOrders();
           setOrders(seed);
@@ -269,7 +194,7 @@ export default function WorkOrderDashboard() {
       }
       try {
         const res = await window.storage.get(HOURS_KEY, true);
-        if (res && res.value) setTimeEntries(JSON.parse(res.value));
+        if (res && res.value) setTimeEntries(JSON.parse(res.value).map(normalizeEntry));
       } catch (e) {
         /* no hours logged yet */
       }
@@ -330,18 +255,28 @@ export default function WorkOrderDashboard() {
     }
   }
 
-  function addTimeEntry(entry) {
-    persistHours([entry, ...timeEntries]);
+  // Save one worker's whole timesheet for one day (replaces that day's entries).
+  function saveTimesheet(date, worker, rows) {
+    const kept = timeEntries.filter((t) => !(t.date === date && t.worker === worker));
+    const added = rows.map((r, i) => ({
+      id: "TE-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 100000),
+      date,
+      worker,
+      woId: r.woId,
+      minutes: r.minutes,
+      note: r.note || "",
+    }));
+    persistHours([...added, ...kept]);
   }
 
   function deleteTimeEntry(id) {
     persistHours(timeEntries.filter((t) => t.id !== id));
   }
 
-  const hoursByWO = useMemo(() => {
+  const minutesByWO = useMemo(() => {
     const map = {};
     timeEntries.forEach((t) => {
-      map[t.woId] = (map[t.woId] || 0) + t.hours;
+      map[t.woId] = (map[t.woId] || 0) + t.minutes;
     });
     return map;
   }, [timeEntries]);
@@ -349,7 +284,7 @@ export default function WorkOrderDashboard() {
   const allWorkerNames = useMemo(() => {
     const set = new Set(workerList);
     (orders || []).forEach((o) => {
-      if (o.assignee && o.assignee !== "Unassigned") set.add(o.assignee);
+      getAssignees(o).forEach((a) => set.add(a));
     });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [workerList, orders]);
@@ -379,7 +314,13 @@ export default function WorkOrderDashboard() {
     if (allWorkerNames.some((w) => w !== oldName && w.toLowerCase() === n.toLowerCase()))
       return "That name is already used.";
     saveWorkerList(allWorkerNames.map((w) => (w === oldName ? n : w)));
-    persist(orders.map((o) => (o.assignee === oldName ? { ...o, assignee: n } : o)));
+    persist(
+      orders.map((o) =>
+        getAssignees(o).includes(oldName)
+          ? { ...o, assignees: getAssignees(o).map((a) => (a === oldName ? n : a)) }
+          : o
+      )
+    );
     persistHours(timeEntries.map((t) => (t.worker === oldName ? { ...t, worker: n } : t)));
     const nextHist = reportHistory.map((r) => ({
       ...r,
@@ -393,7 +334,13 @@ export default function WorkOrderDashboard() {
 
   function removeWorker(name) {
     saveWorkerList(allWorkerNames.filter((w) => w !== name));
-    persist(orders.map((o) => (o.assignee === name ? { ...o, assignee: "Unassigned" } : o)));
+    persist(
+      orders.map((o) =>
+        getAssignees(o).includes(name)
+          ? { ...o, assignees: getAssignees(o).filter((a) => a !== name) }
+          : o
+      )
+    );
     if (assigneeFilter === name) setAssigneeFilter("All");
   }
 
@@ -419,7 +366,9 @@ export default function WorkOrderDashboard() {
 
   const assignees = useMemo(() => {
     if (!orders) return [];
-    return Array.from(new Set(orders.map((o) => o.assignee))).sort();
+    const names = new Set();
+    orders.forEach((o) => workerNamesOf(o).forEach((n) => names.add(n)));
+    return Array.from(names).sort();
   }, [orders]);
 
   const openOrders = useMemo(
@@ -439,8 +388,13 @@ export default function WorkOrderDashboard() {
   );
 
   const unassigned = useMemo(
-    () => openOrders.filter((o) => o.assignee === "Unassigned" || !o.assignee),
+    () => openOrders.filter((o) => getAssignees(o).length === 0),
     [openOrders]
+  );
+
+  const openManMinutes = useMemo(
+    () => openOrders.reduce((sum, o) => sum + (minutesByWO[o.id] || 0), 0),
+    [openOrders, minutesByWO]
   );
 
   const filtered = useMemo(() => {
@@ -453,10 +407,10 @@ export default function WorkOrderDashboard() {
           : statusFilter === "Open+Progress"
           ? o.status === "Open" || o.status === "In Progress"
           : o.status === statusFilter;
-      const assigneeOk = assigneeFilter === "All" || o.assignee === assigneeFilter;
+      const assigneeOk = assigneeFilter === "All" || workerNamesOf(o).includes(assigneeFilter);
       const searchOk =
         q === "" ||
-        [o.id, o.title, o.productCode, o.productName, o.assignee]
+        [o.id, o.title, o.productCode, o.productName, assigneeText(o)]
           .filter(Boolean)
           .some((field) => field.toLowerCase().includes(q));
       return statusOk && assigneeOk && searchOk;
@@ -489,13 +443,13 @@ export default function WorkOrderDashboard() {
 
   const workerCarryOverToday = useMemo(() => {
     const names = Array.from(
-      new Set([...carriedIn, ...closedToday].map((o) => o.assignee || "Unassigned"))
+      new Set([...carriedIn, ...closedToday].flatMap((o) => workerNamesOf(o)))
     ).sort();
     return names.map((name) => ({
       name,
-      inCount: carriedIn.filter((o) => (o.assignee || "Unassigned") === name).length,
-      closedCount: closedToday.filter((o) => (o.assignee || "Unassigned") === name).length,
-      forwardCount: carriedForward.filter((o) => (o.assignee || "Unassigned") === name).length,
+      inCount: carriedIn.filter((o) => workerNamesOf(o).includes(name)).length,
+      closedCount: closedToday.filter((o) => workerNamesOf(o).includes(name)).length,
+      forwardCount: carriedForward.filter((o) => workerNamesOf(o).includes(name)).length,
     }));
   }, [carriedIn, closedToday, carriedForward]);
 
@@ -507,6 +461,8 @@ export default function WorkOrderDashboard() {
   // ---- auto-record today's snapshot into the report archive ----
   useEffect(() => {
     if (!orders) return;
+    // don't create report records for a completely empty system
+    if (orders.length === 0 && reportHistory.length === 0) return;
     const today = todayISO();
     const snapshot = {
       date: today,
@@ -743,6 +699,24 @@ export default function WorkOrderDashboard() {
           border-radius: 4px;
         }
         .wo-icon-btn:hover { background: ${BRAND.paper}; }
+        .wo-link {
+          border: none; background: none; padding: 0; cursor: pointer; text-align: left;
+          font-family: inherit; font-size: 12.5px; font-weight: 700;
+          color: ${BRAND.orangeDark}; text-decoration: underline dotted;
+        }
+        .wo-checklist {
+          border: 1px solid ${BRAND.line}; border-radius: 5px; padding: 6px 8px;
+          max-height: 112px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+        }
+        .wo-field .wo-check {
+          display: flex; align-items: center; gap: 6px; margin: 0;
+          font-size: 13px; font-weight: 500; text-transform: none; letter-spacing: 0; color: ${BRAND.ink};
+        }
+        .wo-field .wo-check input { width: auto; padding: 0; }
+        .wo-mini {
+          border: 1px solid ${BRAND.line}; border-radius: 4px; padding: 5px 7px;
+          font-size: 12.5px; font-family: inherit; box-sizing: border-box;
+        }
         .wo-worker-head {
           width: 100%;
           display: flex;
@@ -870,7 +844,7 @@ export default function WorkOrderDashboard() {
           className={`wo-tab ${tab === "hours" ? "active" : ""}`}
           onClick={() => setTab("hours")}
         >
-          Hours
+          Timesheets
         </button>
       </div>
 
@@ -906,6 +880,12 @@ export default function WorkOrderDashboard() {
                 <div className="wo-kpi" style={{ "--accent": BRAND.warn }}>
                   <div className="wo-kpi-num">{unassigned.length}</div>
                   <div className="wo-kpi-label">Unassigned</div>
+                </div>
+                <div className="wo-kpi" style={{ "--accent": BRAND.info }}>
+                  <div className="wo-kpi-num" style={{ fontSize: 18, lineHeight: 1.2 }}>
+                    {fmtMin(openManMinutes)}
+                  </div>
+                  <div className="wo-kpi-label">Man-hours on open orders</div>
                 </div>
               </div>
 
@@ -953,11 +933,11 @@ export default function WorkOrderDashboard() {
                       onClick={() =>
                         downloadCSV(
                           `work-orders-${todayISO()}.csv`,
-                          ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Status", "Opened", "Due", "Closed", "Hours logged", "Notes"],
+                          ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Status", "Opened", "Due", "Closed", "Minutes logged", "Notes"],
                           filtered.map((o) => [
-                            o.id, o.title, o.productCode, o.productName, o.assignee, o.priority, o.status,
+                            o.id, o.title, o.productCode, o.productName, assigneeText(o), o.priority, o.status,
                             o.createdDate, o.dueDate, o.closedDate || "",
-                            hoursByWO[o.id] ? Math.round(hoursByWO[o.id] * 100) / 100 : "",
+                            minutesByWO[o.id] || "",
                             o.notes,
                           ])
                         )
@@ -989,7 +969,7 @@ export default function WorkOrderDashboard() {
                           <th>Priority</th>
                           <th>Status</th>
                           <th>Opened</th>
-                          <th>Hours</th>
+                          <th>Man-hours</th>
                           <th>Due</th>
                           <th></th>
                         </tr>
@@ -998,7 +978,8 @@ export default function WorkOrderDashboard() {
                         {filtered.map((o) => {
                           const isOverdue = o.dueDate < todayISO() && o.status !== "Completed";
                           return (
-                            <tr key={o.id}>
+                            <Fragment key={o.id}>
+                            <tr>
                               <td className="wo-id">{o.id}</td>
                               <td>
                                 <div className="wo-title">{o.title}</div>
@@ -1028,7 +1009,7 @@ export default function WorkOrderDashboard() {
                               <td>
                                 <div className="wo-assignee">
                                   <UserCircle2 size={15} color={BRAND.gunmetal} />
-                                  {o.assignee}
+                                  {assigneeText(o)}
                                 </div>
                               </td>
                               <td>
@@ -1054,8 +1035,18 @@ export default function WorkOrderDashboard() {
                                 </select>
                               </td>
                               <td>{o.createdDate}</td>
-                              <td style={{ fontWeight: 700 }}>
-                                {hoursByWO[o.id] ? fmtHours(hoursByWO[o.id]) + " h" : "—"}
+                              <td>
+                                {minutesByWO[o.id] ? (
+                                  <button
+                                    className="wo-link"
+                                    title="Show who logged this time"
+                                    onClick={() => setExpandedTimeId(expandedTimeId === o.id ? null : o.id)}
+                                  >
+                                    {fmtMin(minutesByWO[o.id])}
+                                  </button>
+                                ) : (
+                                  "—"
+                                )}
                               </td>
                               <td>
                                 {o.dueDate}
@@ -1080,7 +1071,7 @@ export default function WorkOrderDashboard() {
                                         style={{ background: BRAND.danger, padding: "3px 8px" }}
                                         onClick={() => removeOrder(o.id)}
                                       >
-                                        Delete + its hours?
+                                        Delete + its time entries?
                                       </button>
                                       <button
                                         className="wo-icon-btn"
@@ -1102,6 +1093,14 @@ export default function WorkOrderDashboard() {
                                 </div>
                               </td>
                             </tr>
+                            {expandedTimeId === o.id && minutesByWO[o.id] ? (
+                              <tr>
+                                <td colSpan={10} style={{ background: BRAND.paper }}>
+                                  <TimeBreakdown entries={timeEntries.filter((t) => t.woId === o.id)} />
+                                </td>
+                              </tr>
+                            ) : null}
+                            </Fragment>
                           );
                         })}
                       </tbody>
@@ -1139,7 +1138,7 @@ export default function WorkOrderDashboard() {
               workerNames={allWorkerNames}
               entries={timeEntries}
               onPurge={purgeOrphanHours}
-              onAdd={addTimeEntry}
+              onSaveSheet={saveTimesheet}
               onDelete={deleteTimeEntry}
             />
           ) : (
@@ -1177,13 +1176,13 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
 
   const workerCarryOver = useMemo(() => {
     const names = Array.from(
-      new Set([...carriedIn, ...closedToday].map((o) => o.assignee || "Unassigned"))
+      new Set([...carriedIn, ...closedToday].flatMap((o) => workerNamesOf(o)))
     ).sort();
     return names
       .map((name) => {
-        const inCount = carriedIn.filter((o) => (o.assignee || "Unassigned") === name).length;
-        const closedCount = closedToday.filter((o) => (o.assignee || "Unassigned") === name).length;
-        const forwardCount = carriedForward.filter((o) => (o.assignee || "Unassigned") === name).length;
+        const inCount = carriedIn.filter((o) => workerNamesOf(o).includes(name)).length;
+        const closedCount = closedToday.filter((o) => workerNamesOf(o).includes(name)).length;
+        const forwardCount = carriedForward.filter((o) => workerNamesOf(o).includes(name)).length;
         return { name, inCount, closedCount, forwardCount };
       })
       .sort((a, b) => b.inCount - a.inCount);
@@ -1228,7 +1227,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                   `carry-over-${todayISO()}.csv`,
                   ["ID", "Title", "Assignee", "Opened", "Days open", "Outcome today"],
                   rolloverRows.map((o) => [
-                    o.id, o.title, o.assignee, o.createdDate, daysBetween(o.createdDate, todayISO()),
+                    o.id, o.title, assigneeText(o), o.createdDate, daysBetween(o.createdDate, todayISO()),
                     o.status === "Completed" && o.closedDate === todayISO() ? "Closed today" : "Carried forward",
                   ])
                 )
@@ -1258,7 +1257,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                     <tr key={o.id}>
                       <td className="wo-id">{o.id}</td>
                       <td className="wo-title">{o.title}</td>
-                      <td>{o.assignee}</td>
+                      <td>{assigneeText(o)}</td>
                       <td>{o.createdDate}</td>
                       <td>{daysBetween(o.createdDate, todayISO())}</td>
                       <td>
@@ -1289,7 +1288,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                   `long-pending-${todayISO()}.csv`,
                   ["ID", "Title", "Product code", "Product name", "Assignee", "Priority", "Opened", "Days open"],
                   longPending.map((o) => [
-                    o.id, o.title, o.productCode, o.productName, o.assignee, o.priority,
+                    o.id, o.title, o.productCode, o.productName, assigneeText(o), o.priority,
                     o.createdDate, daysBetween(o.createdDate, todayISO()),
                   ])
                 )
@@ -1340,7 +1339,7 @@ function DailyReport({ orders, carriedIn, closedToday, carriedForward, createdTo
                         <span style={{ color: BRAND.gunmetal, fontSize: 12 }}>—</span>
                       )}
                     </td>
-                    <td>{o.assignee}</td>
+                    <td>{assigneeText(o)}</td>
                     <td>
                       <span className="wo-pill" style={{ background: PRIORITY_COLOR[o.priority] }}>
                         {o.priority}
@@ -1421,7 +1420,7 @@ function WorkerManager({ workers, orders, onAdd, onRename, onRemove }) {
   const openCounts = useMemo(() => {
     const m = {};
     orders.forEach((o) => {
-      if (o.status !== "Completed") m[o.assignee] = (m[o.assignee] || 0) + 1;
+      if (o.status !== "Completed") getAssignees(o).forEach((n) => (m[n] = (m[n] || 0) + 1));
     });
     return m;
   }, [orders]);
@@ -1504,7 +1503,7 @@ function WorkerManager({ workers, orders, onAdd, onRename, onRemove }) {
                               setConfirmRemove(null);
                             }}
                           >
-                            Confirm remove (open orders become Unassigned)
+                            Confirm remove (taken off their work orders)
                           </button>
                           <button className="wo-btn ghost" onClick={() => setConfirmRemove(null)}>
                             Cancel
@@ -1535,7 +1534,7 @@ function WorkerManager({ workers, orders, onAdd, onRename, onRemove }) {
           </ul>
         )}
         <div style={{ fontSize: 11.5, color: BRAND.gunmetal, marginTop: 8 }}>
-          Renaming updates the name on all work orders, logged hours and past reports.
+          Renaming updates the name on all work orders, logged time and past reports.
         </div>
       </div>
     </div>
@@ -1548,9 +1547,10 @@ function WorkerView({ orders }) {
   const byWorker = useMemo(() => {
     const map = {};
     (orders || []).forEach((o) => {
-      const name = o.assignee || "Unassigned";
-      map[name] = map[name] || [];
-      map[name].push(o);
+      workerNamesOf(o).forEach((name) => {
+        map[name] = map[name] || [];
+        map[name].push(o);
+      });
     });
     return Object.entries(map)
       .map(([name, list]) => {
@@ -1609,16 +1609,16 @@ function WorkerView({ orders }) {
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.orange }}>
           <div className="wo-kpi-num">
-            {byWorker.reduce((sum, w) => sum + w.open + w.inProgress + w.onHold, 0)}
+            {(orders || []).filter((o) => o.status !== "Completed").length}
           </div>
           <div className="wo-kpi-label">Total active orders</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.danger }}>
-          <div className="wo-kpi-num">{byWorker.reduce((sum, w) => sum + w.overdue, 0)}</div>
+          <div className="wo-kpi-num">{(orders || []).filter((o) => o.status !== "Completed" && o.dueDate < todayISO()).length}</div>
           <div className="wo-kpi-label">Overdue across team</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.ok }}>
-          <div className="wo-kpi-num">{byWorker.reduce((sum, w) => sum + w.completed, 0)}</div>
+          <div className="wo-kpi-num">{(orders || []).filter((o) => o.status === "Completed").length}</div>
           <div className="wo-kpi-label">Completed all-time</div>
         </div>
       </div>
@@ -1719,52 +1719,141 @@ function WorkerView({ orders }) {
   );
 }
 
-function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
+function TimeBreakdown({ entries }) {
+  const byWorker = {};
+  const byDay = {};
+  entries.forEach((t) => {
+    byWorker[t.worker] = (byWorker[t.worker] || 0) + t.minutes;
+    byDay[t.date] = byDay[t.date] || [];
+    byDay[t.date].push(t);
+  });
+  const days = Object.keys(byDay).sort().reverse();
+  const head = {
+    fontWeight: 800,
+    marginBottom: 4,
+    textTransform: "uppercase",
+    fontSize: 11,
+    color: BRAND.gunmetal,
+  };
+  return (
+    <div style={{ display: "flex", gap: 36, flexWrap: "wrap", padding: "10px 6px", fontSize: 12.5 }}>
+      <div>
+        <div style={head}>Time by worker</div>
+        {Object.entries(byWorker)
+          .sort((a, b) => b[1] - a[1])
+          .map(([n, m]) => (
+            <div key={n}>
+              {n}: <strong>{fmtMin(m)}</strong>
+            </div>
+          ))}
+      </div>
+      <div>
+        <div style={head}>Time by day</div>
+        {days.map((d) => (
+          <div key={d}>
+            <strong>{d}</strong> — {byDay[d].map((t) => t.worker + " " + t.minutes + " min").join(", ")}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HoursView({ orders, workerNames, entries, onSaveSheet, onDelete, onPurge }) {
   const [date, setDate] = useState(todayISO());
   const [worker, setWorker] = useState("");
-  const [woId, setWoId] = useState("");
-  const [hours, setHours] = useState("");
-  const [note, setNote] = useState("");
+  const [sheet, setSheet] = useState({});
+  const [filter, setFilter] = useState("");
   const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
 
-  const workers = workerNames;
-  const orphanCount = useMemo(() => {
-    const ids = new Set(orders.map((o) => o.id));
-    return entries.filter((t) => !ids.has(t.woId)).length;
-  }, [orders, entries]);
   const orderById = useMemo(() => {
     const m = {};
     orders.forEach((o) => (m[o.id] = o));
     return m;
   }, [orders]);
 
-  function submit(e) {
-    e.preventDefault();
-    const h = parseFloat(hours);
-    if (!worker || !woId) return setError("Choose a worker and a work order.");
-    if (!(h > 0) || h > 24) return setError("Hours must be between 0 and 24.");
+  const orphanCount = useMemo(() => {
+    const ids = new Set(orders.map((o) => o.id));
+    return entries.filter((t) => !ids.has(t.woId)).length;
+  }, [orders, entries]);
+
+  // load the saved timesheet whenever the date or worker changes
+  useEffect(() => {
+    const m = {};
+    if (worker) {
+      entries
+        .filter((t) => t.date === date && t.worker === worker)
+        .forEach((t) => {
+          m[t.woId] = { on: true, minutes: String(t.minutes), note: t.note || "" };
+        });
+    }
+    setSheet(m);
     setError("");
-    onAdd({
-      id: "TE-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
-      date,
-      worker,
-      woId,
-      hours: h,
-      note: note.trim(),
+    setSaved("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [date, worker]);
+
+  const rows = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return orders
+      .filter((o) => o.status !== "Completed" || (sheet[o.id] && sheet[o.id].on))
+      .filter(
+        (o) =>
+          !q ||
+          [o.id, o.title, o.productCode, o.productName]
+            .filter(Boolean)
+            .some((f) => f.toLowerCase().includes(q))
+      )
+      .sort((a, b) => (a.id < b.id ? -1 : 1));
+  }, [orders, sheet, filter]);
+
+  const ticked = Object.values(sheet).filter((r) => r.on);
+  const sheetTotal = ticked.reduce((sum, r) => sum + (parseInt(r.minutes, 10) || 0), 0);
+
+  function toggle(id) {
+    setSheet((s) => {
+      const cur = s[id];
+      if (cur && cur.on) return { ...s, [id]: { ...cur, on: false } };
+      return { ...s, [id]: { on: true, minutes: (cur && cur.minutes) || "", note: (cur && cur.note) || "" } };
     });
-    setHours("");
-    setNote("");
+    setSaved("");
+  }
+
+  function setField(id, field, value) {
+    setSheet((s) => ({ ...s, [id]: { ...s[id], [field]: value } }));
+    setSaved("");
+  }
+
+  function save() {
+    if (!worker) return setError("Choose a worker first.");
+    const out = [];
+    for (const [woId, r] of Object.entries(sheet)) {
+      if (!r.on) continue;
+      const m = Number(r.minutes);
+      if (!Number.isInteger(m) || m < 1) return setError("Enter whole minutes (1 or more) for " + woId + ".");
+      out.push({ woId, minutes: m, note: (r.note || "").trim() });
+    }
+    const total = out.reduce((sum, r) => sum + r.minutes, 0);
+    if (total > 1440) return setError("A day can't exceed 1440 minutes (24 hours).");
+    setError("");
+    onSaveSheet(date, worker, out);
+    setSaved(
+      out.length
+        ? "Timesheet saved: " + out.length + " work order(s), " + fmtMin(total) + "."
+        : "Timesheet cleared for this worker and day."
+    );
   }
 
   const dayEntries = useMemo(() => entries.filter((t) => t.date === date), [entries, date]);
   const dayByWorker = useMemo(() => {
     const m = {};
-    dayEntries.forEach((t) => (m[t.worker] = (m[t.worker] || 0) + t.hours));
+    dayEntries.forEach((t) => (m[t.worker] = (m[t.worker] || 0) + t.minutes));
     return Object.entries(m).sort((a, b) => b[1] - a[1]);
   }, [dayEntries]);
-  const dayTotal = dayEntries.reduce((s, t) => s + t.hours, 0);
+  const dayTotal = dayEntries.reduce((sum, t) => sum + t.minutes, 0);
 
   const ranged = useMemo(
     () => entries.filter((t) => (!from || t.date >= from) && (!to || t.date <= to)),
@@ -1774,39 +1863,44 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
     const m = {};
     ranged.forEach((t) => {
       if (!m[t.woId]) m[t.woId] = { woId: t.woId, total: 0, workers: {}, days: new Set() };
-      m[t.woId].total += t.hours;
-      m[t.woId].workers[t.worker] = (m[t.woId].workers[t.worker] || 0) + t.hours;
+      m[t.woId].total += t.minutes;
+      m[t.woId].workers[t.worker] = (m[t.woId].workers[t.worker] || 0) + t.minutes;
       m[t.woId].days.add(t.date);
     });
     return Object.values(m).sort((a, b) => b.total - a.total);
   }, [ranged]);
-  const grandTotal = byWO.reduce((s, r) => s + r.total, 0);
+  const grandTotal = byWO.reduce((sum, r) => sum + r.total, 0);
 
   return (
     <div>
       {orphanCount > 0 && (
-        <div className="wo-panel" style={{ marginBottom: 16, padding: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div
+          className="wo-panel"
+          style={{ marginBottom: 16, padding: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}
+        >
           <AlertTriangle size={16} color={BRAND.warn} />
           <span style={{ fontSize: 13 }}>
-            {orphanCount} logged hour {orphanCount === 1 ? "entry belongs" : "entries belong"} to work orders that were deleted.
+            {orphanCount} time {orphanCount === 1 ? "entry belongs" : "entries belong"} to work orders that were
+            deleted.
           </span>
           <button className="wo-btn" style={{ marginLeft: "auto" }} onClick={onPurge}>
             Remove these entries
           </button>
         </div>
       )}
+
       <div className="wo-kpis" style={{ marginBottom: 18 }}>
         <div className="wo-kpi" style={{ "--accent": BRAND.orange }}>
-          <div className="wo-kpi-num">{fmtHours(dayTotal)}</div>
-          <div className="wo-kpi-label">Hours on {date}</div>
+          <div className="wo-kpi-num" style={{ fontSize: 18, lineHeight: 1.2 }}>{fmtMin(dayTotal)}</div>
+          <div className="wo-kpi-label">Logged on {date}</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.gunmetal }}>
           <div className="wo-kpi-num">{dayByWorker.length}</div>
-          <div className="wo-kpi-label">Workers logged that day</div>
+          <div className="wo-kpi-label">Workers with a timesheet that day</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.ok }}>
-          <div className="wo-kpi-num">{fmtHours(grandTotal)}</div>
-          <div className="wo-kpi-label">Cumulative hours (report range)</div>
+          <div className="wo-kpi-num" style={{ fontSize: 18, lineHeight: 1.2 }}>{fmtMin(grandTotal)}</div>
+          <div className="wo-kpi-label">Cumulative (report range)</div>
         </div>
         <div className="wo-kpi" style={{ "--accent": BRAND.info }}>
           <div className="wo-kpi-num">{byWO.length}</div>
@@ -1814,78 +1908,144 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
         </div>
       </div>
 
+      {/* ---- daily timesheet ---- */}
       <div className="wo-panel" style={{ marginBottom: 16 }}>
         <div className="wo-panel-head">
           <Clock size={16} color={BRAND.orange} />
-          <div className="wo-panel-title">Log hours</div>
-        </div>
-        <form onSubmit={submit} style={{ padding: 16 }}>
-          <div className="wo-field-row">
-            <div className="wo-field">
-              <label>Date</label>
-              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
-            </div>
-            <div className="wo-field">
-              <label>Worker</label>
-              <select value={worker} onChange={(e) => setWorker(e.target.value)}>
-                <option value="">Select worker…</option>
-                {workers.map((w) => (
-                  <option key={w} value={w}>
-                    {w}
-                  </option>
-                ))}
-              </select>
-            </div>
+          <div className="wo-panel-title">Daily timesheet</div>
+          <div className="wo-controls">
+            <input type="date" className="wo-select" value={date} onChange={(e) => setDate(e.target.value)} />
+            <select className="wo-select" value={worker} onChange={(e) => setWorker(e.target.value)}>
+              <option value="">Select worker…</option>
+              {workerNames.map((w) => (
+                <option key={w} value={w}>
+                  {w}
+                </option>
+              ))}
+            </select>
           </div>
-          <div className="wo-field-row">
-            <div className="wo-field" style={{ flex: 2 }}>
-              <label>Work order</label>
-              <select value={woId} onChange={(e) => setWoId(e.target.value)}>
-                <option value="">Select work order…</option>
-                {orders.map((o) => (
-                  <option key={o.id} value={o.id}>
-                    {o.id} — {o.title}
-                  </option>
-                ))}
-              </select>
+        </div>
+
+        {!worker ? (
+          <div className="wo-empty">Choose a worker to fill in their timesheet for {date}.</div>
+        ) : (
+          <div style={{ padding: 16 }}>
+            <div style={{ fontSize: 12.5, color: BRAND.gunmetal, marginBottom: 10 }}>
+              Tick the work orders {worker} worked on and enter the minutes for each. Saving replaces this
+              worker's timesheet for the day.
             </div>
-            <div className="wo-field">
-              <label>Hours</label>
+            <div className="wo-search" style={{ marginBottom: 10, maxWidth: 320 }}>
+              <Search size={13} color={BRAND.gunmetal} />
               <input
-                type="number"
-                step="0.25"
-                min="0"
-                max="24"
-                value={hours}
-                onChange={(e) => setHours(e.target.value)}
-                placeholder="e.g. 2.5"
+                className="wo-search-input"
+                placeholder="Filter work orders…"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
               />
             </div>
+
+            {rows.length === 0 ? (
+              <div className="wo-empty">No open work orders to log time against.</div>
+            ) : (
+              <div style={{ overflowX: "auto", border: "1px solid " + BRAND.line, borderRadius: 6 }}>
+                <table className="wo-table">
+                  <thead>
+                    <tr>
+                      <th></th>
+                      <th>Work order</th>
+                      <th>Assigned</th>
+                      <th>Minutes</th>
+                      <th>Note</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((o) => {
+                      const r = sheet[o.id];
+                      const on = !!(r && r.on);
+                      return (
+                        <tr key={o.id} style={on ? { background: "#FFF6F0" } : undefined}>
+                          <td>
+                            <input type="checkbox" checked={on} onChange={() => toggle(o.id)} />
+                          </td>
+                          <td>
+                            <div>
+                              <span className="wo-id">{o.id}</span> <span className="wo-title">{o.title}</span>
+                            </div>
+                            {(o.productCode || o.productName) && (
+                              <div style={{ fontSize: 11.5, color: BRAND.gunmetal }}>
+                                {[o.productCode, o.productName].filter(Boolean).join(" · ")}
+                              </div>
+                            )}
+                          </td>
+                          <td style={{ fontSize: 12 }}>{assigneeText(o)}</td>
+                          <td>
+                            <input
+                              className="wo-mini"
+                              type="number"
+                              min="1"
+                              step="1"
+                              style={{ width: 90 }}
+                              disabled={!on}
+                              value={on ? r.minutes : ""}
+                              placeholder="min"
+                              onChange={(e) => setField(o.id, "minutes", e.target.value)}
+                            />
+                          </td>
+                          <td>
+                            <input
+                              className="wo-mini"
+                              style={{ width: "100%", minWidth: 140 }}
+                              disabled={!on}
+                              value={on ? r.note : ""}
+                              placeholder="optional"
+                              onChange={(e) => setField(o.id, "note", e.target.value)}
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 12, flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 800, fontSize: 14 }}>
+                Total: <span style={{ color: sheetTotal > 1440 ? BRAND.danger : BRAND.orange }}>{fmtMin(sheetTotal)}</span>
+                <span style={{ fontWeight: 500, fontSize: 12, color: BRAND.gunmetal }}>
+                  {" "}
+                  · {ticked.length} work order(s)
+                </span>
+              </div>
+              <button className="wo-btn" onClick={save}>
+                Save timesheet
+              </button>
+              {error && <span style={{ color: BRAND.danger, fontSize: 12.5 }}>{error}</span>}
+              {saved && <span style={{ color: BRAND.ok, fontSize: 12.5, fontWeight: 700 }}>{saved}</span>}
+            </div>
           </div>
-          <div className="wo-field">
-            <label>Note (optional)</label>
-            <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="What was done" />
-          </div>
-          {error && <div style={{ color: BRAND.danger, fontSize: 12, marginBottom: 8 }}>{error}</div>}
-          <button type="submit" className="wo-btn">
-            <Plus size={14} /> Add hours
-          </button>
-        </form>
+        )}
       </div>
 
+      {/* ---- day record ---- */}
       <div className="wo-panel" style={{ marginBottom: 16 }}>
         <div className="wo-panel-head">
           <UserCircle2 size={16} color={BRAND.orange} />
-          <div className="wo-panel-title">Daily hours — {date}</div>
+          <div className="wo-panel-title">Time recorded — {date}</div>
           <div className="wo-controls">
             <ExportBtn
               label="Export this day"
               onClick={() =>
                 downloadCSV(
-                  `hours-${date}.csv`,
-                  ["Date", "Worker", "Work order", "Title", "Hours", "Note"],
+                  "timesheets-" + date + ".csv",
+                  ["Date", "Worker", "Work order", "Title", "Minutes", "Note"],
                   dayEntries.map((t) => [
-                    t.date, t.worker, t.woId, orderById[t.woId] ? orderById[t.woId].title : "", t.hours, t.note,
+                    t.date,
+                    t.worker,
+                    t.woId,
+                    orderById[t.woId] ? orderById[t.woId].title : "",
+                    t.minutes,
+                    t.note,
                   ])
                 )
               }
@@ -1893,7 +2053,7 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
           </div>
         </div>
         {dayEntries.length === 0 ? (
-          <div className="wo-empty">No hours logged for this date.</div>
+          <div className="wo-empty">No time recorded for this date.</div>
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table className="wo-table">
@@ -1901,22 +2061,21 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
                 <tr>
                   <th>Worker</th>
                   <th>Work order</th>
-                  <th>Hours</th>
+                  <th>Minutes</th>
                   <th>Note</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody>
                 {[...dayEntries]
-                  .sort((a, b) => (a.worker < b.worker ? -1 : 1))
+                  .sort((a, b) => (a.worker < b.worker ? -1 : a.worker > b.worker ? 1 : a.woId < b.woId ? -1 : 1))
                   .map((t) => (
                     <tr key={t.id}>
                       <td>{t.worker}</td>
                       <td>
-                        <span className="wo-id">{t.woId}</span>{" "}
-                        {orderById[t.woId] ? orderById[t.woId].title : ""}
+                        <span className="wo-id">{t.woId}</span> {orderById[t.woId] ? orderById[t.woId].title : ""}
                       </td>
-                      <td style={{ fontWeight: 700 }}>{fmtHours(t.hours)}</td>
+                      <td style={{ fontWeight: 700 }}>{t.minutes} min</td>
                       <td style={{ color: BRAND.gunmetal, fontSize: 12 }}>{t.note}</td>
                       <td>
                         <button className="wo-icon-btn" title="Delete entry" onClick={() => onDelete(t.id)}>
@@ -1928,32 +2087,33 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
               </tbody>
             </table>
             <ul className="wo-report-list" style={{ padding: "8px 16px", background: BRAND.paper }}>
-              {dayByWorker.map(([name, h]) => (
+              {dayByWorker.map(([name, m]) => (
                 <li key={name}>
                   <span>{name} — total for the day</span>
-                  <span style={{ fontWeight: 800 }}>{fmtHours(h)} h</span>
+                  <span style={{ fontWeight: 800 }}>{fmtMin(m)}</span>
                 </li>
               ))}
               <li>
                 <span style={{ fontWeight: 800 }}>All workers</span>
-                <span style={{ fontWeight: 800, color: BRAND.orange }}>{fmtHours(dayTotal)} h</span>
+                <span style={{ fontWeight: 800, color: BRAND.orange }}>{fmtMin(dayTotal)}</span>
               </li>
             </ul>
           </div>
         )}
       </div>
 
+      {/* ---- cumulative by work order ---- */}
       <div className="wo-panel">
         <div className="wo-panel-head">
           <ClipboardList size={16} color={BRAND.orange} />
-          <div className="wo-panel-title">Cumulative hours by work order</div>
+          <div className="wo-panel-title">Cumulative time by work order</div>
           <div className="wo-controls">
             <ExportBtn
               label="Export summary"
               onClick={() =>
                 downloadCSV(
-                  `hours-by-work-order-${todayISO()}.csv`,
-                  ["Work order", "Title", "Product code", "Status", "Hours by worker", "Days worked", "Total hours"],
+                  "time-by-work-order-" + todayISO() + ".csv",
+                  ["Work order", "Title", "Product code", "Status", "Minutes by worker", "Days worked", "Total minutes"],
                   byWO.map((r) => {
                     const o = orderById[r.woId];
                     return [
@@ -1963,10 +2123,10 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
                       o ? o.status : "",
                       Object.entries(r.workers)
                         .sort((a, b) => b[1] - a[1])
-                        .map(([n, h]) => n + ": " + fmtHours(h) + " h")
+                        .map(([n, m]) => n + ": " + m + " min")
                         .join("; "),
                       r.days.size,
-                      Math.round(r.total * 100) / 100,
+                      r.total,
                     ];
                   })
                 )
@@ -1976,33 +2136,24 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
               label="Export all entries"
               onClick={() =>
                 downloadCSV(
-                  `hours-entries-${todayISO()}.csv`,
-                  ["Date", "Worker", "Work order", "Title", "Product code", "Hours", "Note"],
+                  "time-entries-" + todayISO() + ".csv",
+                  ["Date", "Worker", "Work order", "Title", "Product code", "Minutes", "Note"],
                   [...ranged]
                     .sort((a, b) => (a.date < b.date ? 1 : -1))
                     .map((t) => [
-                      t.date, t.worker, t.woId,
+                      t.date,
+                      t.worker,
+                      t.woId,
                       orderById[t.woId] ? orderById[t.woId].title : "",
                       orderById[t.woId] ? orderById[t.woId].productCode : "",
-                      t.hours, t.note,
+                      t.minutes,
+                      t.note,
                     ])
                 )
               }
             />
-            <input
-              type="date"
-              className="wo-select"
-              value={from}
-              onChange={(e) => setFrom(e.target.value)}
-              title="From"
-            />
-            <input
-              type="date"
-              className="wo-select"
-              value={to}
-              onChange={(e) => setTo(e.target.value)}
-              title="To"
-            />
+            <input type="date" className="wo-select" value={from} onChange={(e) => setFrom(e.target.value)} title="From" />
+            <input type="date" className="wo-select" value={to} onChange={(e) => setTo(e.target.value)} title="To" />
             {(from || to) && (
               <button
                 className="wo-btn ghost"
@@ -2017,7 +2168,7 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
           </div>
         </div>
         {byWO.length === 0 ? (
-          <div className="wo-empty">No hours logged in this range.</div>
+          <div className="wo-empty">No time recorded in this range.</div>
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table className="wo-table">
@@ -2026,9 +2177,9 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
                   <th>Work order</th>
                   <th>Product</th>
                   <th>Status</th>
-                  <th>Hours by worker</th>
+                  <th>Time by worker</th>
                   <th>Days worked</th>
-                  <th>Total hours</th>
+                  <th>Total time</th>
                 </tr>
               </thead>
               <tbody>
@@ -2047,14 +2198,14 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
                       <td style={{ fontSize: 12 }}>
                         {Object.entries(r.workers)
                           .sort((a, b) => b[1] - a[1])
-                          .map(([n, h]) => (
+                          .map(([n, m]) => (
                             <div key={n}>
-                              {n}: <strong>{fmtHours(h)} h</strong>
+                              {n}: <strong>{m} min</strong>
                             </div>
                           ))}
                       </td>
                       <td>{r.days.size}</td>
-                      <td style={{ fontWeight: 800, color: BRAND.orange }}>{fmtHours(r.total)} h</td>
+                      <td style={{ fontWeight: 800, color: BRAND.orange }}>{fmtMin(r.total)}</td>
                     </tr>
                   );
                 })}
@@ -2062,7 +2213,7 @@ function HoursView({ orders, workerNames, entries, onAdd, onDelete, onPurge }) {
                   <td colSpan={5} style={{ fontWeight: 800, textAlign: "right" }}>
                     Grand total
                   </td>
-                  <td style={{ fontWeight: 800 }}>{fmtHours(grandTotal)} h</td>
+                  <td style={{ fontWeight: 800 }}>{fmtMin(grandTotal)}</td>
                 </tr>
               </tbody>
             </table>
@@ -2300,12 +2451,12 @@ function ReportsArchive({ history, onDelete }) {
 
 function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
   const [form, setForm] = useState(
-    initial || {
+    (initial && normalizeOrder(initial)) || {
       id: nextId(existingIds),
       title: "",
       productCode: "",
       productName: "",
-      assignee: "Unassigned",
+      assignees: [],
       priority: "Medium",
       status: "Open",
       createdDate: todayISO(),
@@ -2377,17 +2528,34 @@ function OrderForm({ initial, existingIds, workers = [], onCancel, onSave }) {
           </div>
           <div className="wo-field-row">
             <div className="wo-field">
-              <label>Assignee</label>
-              <select value={form.assignee} onChange={(e) => set("assignee", e.target.value)}>
-                <option value="Unassigned">Unassigned</option>
-                {Array.from(new Set([...workers, form.assignee]))
-                  .filter((w) => w && w !== "Unassigned")
-                  .map((w) => (
-                    <option key={w} value={w}>
-                      {w}
-                    </option>
-                  ))}
-              </select>
+              <label>Assigned workers (pick one or more)</label>
+              <div className="wo-checklist">
+                {Array.from(new Set([...workers, ...form.assignees])).length === 0 ? (
+                  <span style={{ fontSize: 12, color: BRAND.gunmetal }}>
+                    No workers yet — add them on the Workers tab.
+                  </span>
+                ) : (
+                  Array.from(new Set([...workers, ...form.assignees]))
+                    .sort()
+                    .map((w) => (
+                      <label key={w} className="wo-check">
+                        <input
+                          type="checkbox"
+                          checked={form.assignees.includes(w)}
+                          onChange={() =>
+                            set(
+                              "assignees",
+                              form.assignees.includes(w)
+                                ? form.assignees.filter((x) => x !== w)
+                                : [...form.assignees, w]
+                            )
+                          }
+                        />
+                        {w}
+                      </label>
+                    ))
+                )}
+              </div>
             </div>
             <div className="wo-field">
               <label>Priority</label>
